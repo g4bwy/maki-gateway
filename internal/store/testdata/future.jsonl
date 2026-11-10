@@ -1,0 +1,2 @@
+{"t":"header","v":9,"id":"future","model":"unknown/new-thing","cwd":"/home/dev/future","created_at":1799900000}
+{"t":"msg","d":{"role":"user","content":[{"type":"text","text":"written by a maki newer than this reader"}]}}

@@ -1,0 +1,5 @@
+{"t":"header","v":3,"id":"beta","model":"zai/glm-4.6","cwd":"/home/dev/beta","created_at":1781100000}
+{"t":"msg","d":{"role":"user","content":[{"type":"text","text":"why does the gateway refuse a non-loopback bind"}]}}
+{"t":"msg","d":{"role":"assistant","content":[{"type":"text","text":"because it has no auth token configured"}]}}
+{"t":"frame","d":{"system":"placeholder","tools":[]}}
+{"t":"meta","title":"gateway bind refusal","token_usage":{"input_tokens":40,"output_tokens":12,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"updated_at":1781100600,"mode":"plan","usage_by_model":{"zai/glm-4.6":{"input":40,"output":12}}}

@@ -1,0 +1,3 @@
+{"t":"header","d":{"v":3,"id":"delta","model":"xai/grok-4","cwd":"/home/dev/delta","created_at":1781300000}}
+{"t":"msg","d":{"role":"user","content":[{"type":"text","text":"contract shaped header and meta"}]}}
+{"t":"meta","d":{"title":"nested shape","updated_at":1781300500,"usage_by_model":{"xai/grok-4":{"input":11,"output":5,"cost":0.5}}}}

@@ -1,0 +1,2 @@
+{"t":"header","v":2,"id":"zeta","model":"llama-cpp/qwen","cwd":"/home/dev/zeta","created_at":1781400000}
+{"t":"msg","d":{"role":"user","content":[{"type":"text","text":"a session that never wrote a meta record"}]}}
