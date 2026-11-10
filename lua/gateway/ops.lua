@@ -94,6 +94,7 @@ function H.list(_req)
       cwd = extra.cwd,
       model = extra.model,
       focused = focused and true or false,
+      updated_at = tonumber(s.updated_at) or 0,
     }
   end
   return protocol.array(out)

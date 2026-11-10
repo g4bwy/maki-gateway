@@ -118,10 +118,21 @@ Blocks (tagged by `type`): `{"type":"text","text"}`, `{"type":"tool_use","id","n
 
 File rules (hard-won, do not violate): read-only, take NO lock; consume only `\n`-terminated
 lines; a rewrite can shrink the file so never seek by stored offset across reads; header line 1
-has `{v,id,model,cwd,created_at}`; trailing `{"t":"meta","d":{title,token_usage,updated_at,
-usage_by_model:{model:{input,output,cache_creation,cache_read,cost}},subagents:[]}}` is latest-wins
-analytics source; `maki session list --json` / `export <id>` / `delete <id> --force` are the CLI
-surface (list writes a scan cache side effect, cwd filter is exact-string).
+is FLAT `{"t":"header","v":..,"id":..,"model":..,"cwd":..,"created_at":..}` (no `d` wrapper —
+only msg/out/sub_msg/frame use `d`; readers accept both shapes); trailing `meta` record is FLAT
+too: `{"t":"meta","title":..,"token_usage":{..},"updated_at":..,"usage_by_model":{model:{input,
+output,cache_creation,cache_read,cost}},...}` latest-wins, analytics source (tail window 32 KiB,
+grow to 1 MiB when no complete meta found); `maki session list --json` / `export <id>` /
+`delete <id> --force` are the CLI surface (list writes a scan cache side effect, cwd filter is
+exact-string).
+
+### Attach error substrings (Lua plugin MUST keep these words; gateway maps them, attach.go:436)
+
+`"session not live"`, `"expired"`, `"unknown"`, `"no such"` → 404 · `"another"` / `"elsewhere"`
+→ 409 open elsewhere · `"busy"` → 409 busy. The attach engine sends `{"op":"permissions",
+"on":true}` automatically after `hello`. `list` rows MAY carry `updated_at` (int seconds; the
+engine decodes it when present; live rows otherwise show 0). `focused` is not part of
+model.Session; it travels only on `status` events.
 
 ACP update passthrough (`engine:"acp"`) uses ACP shapes: `sessionUpdate` one of
 `agent_message_chunk|agent_thought_chunk|tool_call|tool_call_update|usage_update|current_mode_update|config_option_update`,
