@@ -51,6 +51,14 @@ type Message struct {
 	Kind        *string         `json:"kind,omitempty"`
 }
 
+// SearchHit is one /api/search result (CONTRACTS 2). It lives here so the
+// httpapi capability probe and store's searcher agree by construction.
+type SearchHit struct {
+	Session string `json:"session"`
+	Title   string `json:"title"`
+	Snippet string `json:"snippet"`
+}
+
 // Event is the SSE envelope (CONTRACTS 2). Fields are per-type; empty ones are omitted.
 type Event struct {
 	Type      string          `json:"type"`

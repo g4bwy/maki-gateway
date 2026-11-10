@@ -25,11 +25,7 @@ type analyst interface {
 }
 
 // SearchHit is one /api/search result (CONTRACTS 2).
-type SearchHit struct {
-	Session string `json:"session"`
-	Title   string `json:"title"`
-	Snippet string `json:"snippet"`
-}
+type SearchHit = model.SearchHit
 
 func (s *Server) routes() {
 	m := http.NewServeMux()

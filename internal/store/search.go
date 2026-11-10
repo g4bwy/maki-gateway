@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"maki-gateway/internal/model"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -13,11 +14,7 @@ import (
 
 // Hit is one search result: the session, its title, and a window of raw log
 // text around the match (CONTRACTS 2, GET /api/search).
-type Hit struct {
-	Session string `json:"session"`
-	Title   string `json:"title"`
-	Snippet string `json:"snippet"`
-}
+type Hit = model.SearchHit
 
 const (
 	// searchWorkers bounds the parallel log scan: history runs to gigabytes,
