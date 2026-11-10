@@ -66,6 +66,13 @@ with no answer, call `prev(req, ctx)` (fall through to the human prompt) and emi
 
 All JSON. Base = the bind addr. Static UI served from `/` (files in `web/`).
 
+A token bind (a non-loopback address with `MAKI_GATEWAY_TOKEN` set) accepts three credentials:
+`?token=`, `Authorization: Bearer`, and the `maki_gw` cookie. Static assets authenticate by that
+cookie, because the browser carries neither of the other two forms on the `/app.js` and
+`/style.css` requests the page makes. The gateway sets the cookie (`HttpOnly`, `SameSite=Strict`,
+`Path=/`) on the first request that passes on a URL or header credential, so loading the document
+seeds the session. A loopback bind needs no credential and never sets a cookie.
+
 | method path | request | response |
 |---|---|---|
 | GET /api/health | — | `{"version":str,"maki":str,"sessions":int}` |
@@ -74,11 +81,11 @@ All JSON. Base = the bind addr. Static UI served from `/` (files in `web/`).
 | DELETE /api/sessions/{id} | — | `{"killed":bool}` — kills a **web** process only; 400 for live/stored |
 | GET /api/sessions/{id}/messages?last=200 | — | `{"source":"acp"\|"attach"\|"file","messages":[Message]}` |
 | POST /api/sessions/{id}/prompt | `{"text":str}` | `{"state":"started"\|"queued"}`; 409 `{"error":"busy"}` when a web session is mid-prompt; 409 `"open elsewhere"` on claim clash |
-| POST /api/sessions/{id}/cancel | — | `{"cancelled":bool}`; 501 for live sessions (no plugin API exists yet) |
+| POST /api/sessions/{id}/cancel | — | `{"cancelled":bool}`; 501 for live sessions (no plugin API exists yet), 404 for stored ones (nothing runs to stop) |
 | POST /api/sessions/{id}/mode | `{"mode":"build"\|"plan"}` | `{"ok":true}` |
 | POST /api/sessions/{id}/title | `{"title":str\|null}` | `{"ok":true}`. Rename is live-only: kind `web` answers 501 (`maki-acp` dispatches no `session/set_title`), kind `stored` answers 405 |
 | POST /api/permissions/{engine}/{request_id} | `{"decision":"allow"\|"deny","guidance"?:str}` | `{"ok":true}`; 404 expired. `{engine}` is `"acp"` or `"attach"`; request ids are per-engine counters |
-| GET /api/plan/{id} | — | plan object as in socket `plan` op (web sessions: 501) |
+| GET /api/plan/{id} | — | plan object as in socket `plan` op. 501 for web sessions and for stored sessions, since only the attach bridge can read a plan |
 | GET /api/search?q= | — | `{"hits":[{"session":id,"snippet":str,"title":str}]}` (substring scan of jsonl, cap 50) |
 | GET /api/analytics?days=30 | — | `{"daily":[{"date":"YYYY-MM-DD","sessions":int,"input":int,"output":int,"cache_read":int,"cache_creation":int,"cost":num}],"per_session":[{"session":id,"title":str,"model":str,"cost":num,"updated_at":int}]}` |
 | GET /api/events | — | SSE stream, see below |
@@ -92,7 +99,7 @@ All JSON. Base = the bind addr. Static UI served from `/` (files in `web/`).
 | sessions | — | list changed, refetch GET /api/sessions. Only a visible change counts: a row whose `updated_at` moved and nothing else raises nothing |
 | update | `session,engine:"acp",event:<raw ACP session/update params>` | web session live stream (chunks, tool cards, usage) |
 | dirty | `session,reason:"turn_end"\|"tool_done"\|"tool_start"\|"status"` | attach session changed: refetch its messages (cheap; no delta events exist in maki) |
-| status | `session,status,title,focused` | merged from both engines |
+| status | `session` plus any of `status?`, `title?`, `focused?`, `engine?` | one session changed. Every field but `session` is optional and appears only when the source knew it: a plugin tab reports `status,title,focused`, a rename sends `title` alone, a model change sends `session` alone, and a web session sends `status,title,engine` with no `focused`. Patch the fields that are present and refetch the list |
 | permission | `request_id,session,tool,input,engine:"acp"\|"attach"` | show dialog; answer via POST /api/permissions |
 | permission_cancel | `request_id` | dialog withdrawn (fell through / answered elsewhere) |
 | notice | `text` | toast (process exit, plugin connect/disconnect) |

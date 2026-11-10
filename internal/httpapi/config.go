@@ -22,6 +22,9 @@ import (
 
 const (
 	tokenEnv       = "MAKI_GATEWAY_TOKEN"
+	tokenQuery     = "token"
+	authCookie     = "maki_gw"
+	bearerScheme   = "Bearer"
 	defaultVersion = "dev"
 	defaultLast    = 200
 	defaultDays    = 30
@@ -114,7 +117,7 @@ func New(cfg Config) (*Server, error) {
 
 // ServeHTTP enforces auth, then serves through a status-logging wrapper.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.auth.required && !s.auth.allows(r) {
+	if s.auth.required && !s.auth.allows(w, r) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -123,17 +126,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("request", "method", r.Method, "path", r.URL.Path, "status", rec.status)
 }
 
-func (a authChecker) allows(r *http.Request) bool {
-	got := ""
-	if v := r.URL.Query().Get("token"); v != "" {
-		got = v
-	} else if h := r.Header.Get("Authorization"); h != "" {
-		scheme, cred, ok := strings.Cut(h, " ")
-		if ok && strings.EqualFold(scheme, "Bearer") {
-			got = cred
-		}
+// allows reports whether r carries the token. A credential from the URL or the
+// header is mirrored into the authCookie cookie first: the browser fetches
+// /app.js and /style.css as subresource requests that can carry neither form,
+// so the request that loads the document seeds the cookie those requests send
+// back (CONTRACTS 2). A request arriving with only the cookie is already
+// authenticated and gets no new Set-Cookie.
+func (a authChecker) allows(w http.ResponseWriter, r *http.Request) bool {
+	if url, hdr := r.URL.Query().Get(tokenQuery), bearerToken(r); a.accepted(url) || a.accepted(hdr) {
+		a.seed(w)
+		return true
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
+	return a.accepted(cookieToken(r))
+}
+
+func (a authChecker) accepted(got string) bool {
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
+}
+
+func (a authChecker) seed(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     authCookie,
+		Value:    a.token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func bearerToken(r *http.Request) string {
+	scheme, cred, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, bearerScheme) {
+		return ""
+	}
+	return cred
+}
+
+func cookieToken(r *http.Request) string {
+	c, err := r.Cookie(authCookie)
+	if err != nil {
+		return ""
+	}
+	return c.Value
 }
 
 // MakiVersion caches one `maki --version` execution for the process lifetime.

@@ -421,6 +421,63 @@ await tick(120);
 check('transcript still rendered after rail work', tr.children.length >= 2, tr.children.length + ' rows, current=' + M.S.current);
 check('row text still present', txt(tr).length > 20, JSON.stringify(txt(tr).slice(0, 60)));
 
+/* render unit: tool cards keep their state across repaints with pooled rows.
+   A tool_use and its tool_result are separate messages on the wire (CONTRACTS 3),
+   so this drives that shape directly instead of through the mock sessions. */
+const { renderTranscript } = await import(WEB + 'render.js');
+const saveMsgs = M.S.messages;
+const savePend = M.S.pending;
+M.S.pending = [];
+const useRow = {
+  role: 'assistant', created_at: 1700000001000,
+  content: [{ type: 'tool_use', id: 'tu_d', name: 'bash', status: 'completed', input: { command: 'git push' } }],
+};
+const resRow = {
+  role: 'user', created_at: 1700000002000,
+  content: [{ type: 'tool_result', tool_use_id: 'tu_d', content: 'denied by user', is_error: true }],
+};
+M.S.messages = [useRow, resRow];
+const probe = document.createElement('div');
+renderTranscript(probe);
+const pcard = has(probe, 'tool')[0];
+check('failed result marks the tool card failed', !!pcard && pcard.className.includes('s-failed')
+  && !pcard.className.includes('s-completed'), pcard && pcard.className);
+check('failed result rewrites the chip text', txt(has(pcard, 'chip')[0]) === 'failed', txt(has(pcard, 'chip')[0]));
+check('result body lands inside the card', has(pcard, 'res').length === 1 && txt(pcard).includes('denied by user'), txt(has(pcard, 'res')[0]));
+
+const useNode = probe.children[0];
+const resNode = probe.children[1];
+resRow.content = [{ type: 'tool_result', tool_use_id: 'tu_d', content: 'denied by user (asked twice)', is_error: true }];
+renderTranscript(probe);
+check('repaint reuses both pooled rows', probe.children[0] === useNode && probe.children[1] === resNode);
+check('pooled card restore reattaches the new result', has(pcard, 'res').length === 1
+  && txt(pcard).includes('asked twice') && has(probe, 'result').length === 0,
+has(pcard, 'res').length + ' res, ' + txt(pcard).slice(0, 60));
+check('pooled repaint keeps the failed chip', txt(has(pcard, 'chip')[0]) === 'failed', txt(has(pcard, 'chip')[0]));
+
+useRow.content = [{ type: 'tool_use', id: 'tu_d', name: 'bash', status: 'failed', is_error: true, input: { command: 'git push' } }];
+renderTranscript(probe);
+const rebuilt = has(probe, 'tool')[0];
+check('repainted card rebuilds with its result attached', rebuilt !== pcard
+  && has(rebuilt, 'res').length === 1 && txt(rebuilt).includes('asked twice')
+  && has(probe, 'result').length === 0, txt(rebuilt).slice(0, 80));
+check('rebuilt card keeps the failed chip', txt(has(rebuilt, 'chip')[0]) === 'failed'
+  && rebuilt.className.includes('s-failed'), txt(has(rebuilt, 'chip')[0]));
+
+const orphan = {
+  role: 'user', created_at: 1700000003000,
+  content: [{ type: 'tool_result', tool_use_id: 'tu_gone', content: 'no tool_use in this window', is_error: true }],
+};
+M.S.messages = [orphan];
+const probe2 = document.createElement('div');
+renderTranscript(probe2);
+const solo = has(probe2, 'result')[0];
+check('orphan result rebuilds a failed card of its own', !!solo && solo.className.includes('s-failed')
+  && txt(has(solo, 'chip')[0]) === 'failed' && txt(solo).includes('no tool_use in this window')
+  && has(solo, 'card-label').length === 1 && txt(has(solo, 'card-label')[0]) === 'error', txt(solo).slice(0, 60));
+M.S.messages = saveMsgs;
+M.S.pending = savePend;
+
 console.log('\n--- transcript tail ---');
 console.log(tr.children.slice(-3).map((c) => c.className + ' :: ' + txt(c).replace(/\s+/g, ' ').slice(0, 100)).join('\n'));
 console.log('\n' + (fails ? fails + ' CHECKS FAILED' : 'ALL CHECKS PASSED'));

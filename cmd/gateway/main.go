@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,7 +32,7 @@ func main() {
 	makiPath := flag.String("maki", "maki", "path to the maki binary")
 	addr := flag.String("addr", defaultAddr, "listen address")
 	state := flag.String("state", defaultStateDir(), "maki state directory")
-	webDir := flag.String("web", "web", "directory holding the static UI")
+	webDir := flag.String("web", "web", "directory holding the static UI (falls back to web beside the binary)")
 	sockDir := flag.String("sockdir", "", "attach socket directory (default <state>/gateway)")
 	flag.Parse()
 	if *sockDir == "" {
@@ -38,6 +40,11 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
+	uiDir, err := resolveWebDir(*webDir, exeDir())
+	if err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -61,7 +68,7 @@ func main() {
 		MakiPath:  *makiPath,
 		Addr:      *addr,
 		LookupEnv: os.Getenv,
-		Static:    httpapi.StaticHandler(*webDir),
+		Static:    httpapi.StaticHandler(uiDir),
 		Engines:   engines,
 		Ctx:       ctx,
 	})
@@ -78,7 +85,7 @@ func main() {
 			stop()
 		}
 	}()
-	slog.Info("gateway listening", "addr", *addr, "state", *state, "sockdir", *sockDir)
+	slog.Info("gateway listening", "addr", *addr, "state", *state, "sockdir", *sockDir, "web", uiDir)
 
 	<-ctx.Done()
 	shutCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
@@ -87,6 +94,44 @@ func main() {
 		slog.Warn("graceful shutdown failed, forcing close", "err", err)
 	}
 	httpSrv.Close()
+}
+
+// resolveWebDir picks the directory holding the static UI. Starting from an
+// unrelated cwd would otherwise serve a shell of 404s in silence, so a missing
+// directory or index.html is fatal. The fallback beside the binary covers an
+// installed gateway started from anywhere.
+func resolveWebDir(flagPath, exePath string) (string, error) {
+	cands := []string{flagPath}
+	if exePath != "" {
+		cands = append(cands, filepath.Join(exePath, "web"))
+	}
+	abs := make([]string, 0, len(cands))
+	for _, c := range cands {
+		dir, err := filepath.Abs(c)
+		if err != nil {
+			dir = c
+		}
+		abs = append(abs, dir)
+		if hasIndex(dir) {
+			return dir, nil
+		}
+	}
+	return "", fmt.Errorf("static UI not found: no index.html under %s; "+
+		"run from the repo root or pass -web <dir>", strings.Join(abs, ", "))
+}
+
+func hasIndex(dir string) bool {
+	fi, err := os.Stat(filepath.Join(dir, "index.html"))
+	return err == nil && !fi.IsDir()
+}
+
+// exeDir is the directory of the running binary, "" when the OS cannot say.
+func exeDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Dir(exe)
 }
 
 func defaultStateDir() string {

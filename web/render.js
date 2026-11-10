@@ -61,7 +61,7 @@ export function renderTranscript(root) {
   const pool = new Map();
   for (const n of Array.from(root.children)) if (n.dataset.k) pool.set(n.dataset.k, n);
 
-  const cards = new Map();
+  const ctx = { cards: new Map(), results: resultsById(list), own: null };
   const nodes = [];
   const used = new Set();
   for (const m of list) {
@@ -72,16 +72,15 @@ export function renderTranscript(root) {
     let node = pool.get(key);
     if (node) {
       pool.delete(key);
-      if (node._sig !== sig) paintBody(node, m, cards);
-      else for (const [id, c] of node._cards) cards.set(id, c);
+      if (node._sig !== sig) paintBody(node, m, ctx);
+      else for (const [id, c] of node._cards) ctx.cards.set(id, c);
     } else {
       node = el('div', 'msg');
       node.dataset.k = key;
-      node._cards = new Map();
       node._who = el('div', 'who');
       node._body = el('div', 'body');
       node.append(node._who, node._body);
-      paintBody(node, m, cards);
+      paintBody(node, m, ctx);
     }
     nodes.push(node);
   }
@@ -103,31 +102,45 @@ const whoFor = (m) => (m.role === 'user'
   ? (m._pending ? 'you · sending' : 'you')
   : (m._stream ? 'assistant · streaming' : 'assistant'));
 
-function paintBody(node, m, cards) {
-  node._cards = new Map();
+/**
+ * tool_result blocks by tool_use id. A card can be repainted while its result
+ * sits in another row that does not change, so the result is looked up from the
+ * data rather than from whatever DOM the last pass left behind.
+ */
+function resultsById(list) {
+  const by = new Map();
+  for (const m of list) {
+    for (const b of blocks(m)) if (b && b.type === 'tool_result' && b.tool_use_id) by.set(b.tool_use_id, b);
+  }
+  return by;
+}
+
+function paintBody(node, m, ctx) {
+  const own = new Map();
+  ctx.own = own;
+  node._cards = own;
   node.classList.toggle('user', m.role === 'user');
   node.classList.toggle('stream', !!m._stream);
   node._who.textContent = whoFor(m);
   if (m.created_at) node._who.append(el('span', 'when', ago(m.created_at)));
   const parts = [];
   let i = 0;
-  for (const b of blocks(m)) parts.push(block(b, i++, m, cards));
+  for (const b of blocks(m)) parts.push(block(b, i++, m, ctx));
   if (m._usage) parts.push(usageLine(m._usage));
   node._body.replaceChildren(...parts);
   node._sig = sigOf(m);
 }
 
 /** One content block to a node. A tool_result folds into its tool_use card. */
-function block(b, i, m, cards) {
+function block(b, i, m, ctx) {
   const type = (b && b.type) || 'unknown';
   if (type === 'text') return markdownEl(el('div'), b.text || '');
   if (type === 'thinking') return fold('thinking', 'Thinking', 'th:' + (m._key || 'x') + ':' + i, pre(b.thinking || b.text || ''));
-  if (type === 'tool_use') return toolCard(b, cards);
+  if (type === 'tool_use') return toolCard(b, ctx);
   if (type === 'tool_result') {
-    const card = b.tool_use_id ? cards.get(b.tool_use_id) : null;
+    const card = b.tool_use_id ? ctx.cards.get(b.tool_use_id) : null;
     if (card) return attachResult(card, b);
-    return fold('card result', b.is_error ? 'Error' : 'Result', 'r:' + (b.tool_use_id || i),
-      preClip(resultText(b.content), b.is_error));
+    return resultCard(b);
   }
   if (type === 'image') {
     const box = el('div', 'imgph');
@@ -166,28 +179,69 @@ function fold(cls, label, key, content) {
   return collapsible(box, head, body, key);
 }
 
-function toolCard(b, cards) {
+/** Tool states the card and chip classes carry. Terminal wins over in flight. */
+const TOOL_STATES = ['queued', 'in_progress', 'completed', 'failed'];
+
+/** Move a card to a state: class and chip text always change together. */
+function setStatus(card, status) {
+  for (const s of TOOL_STATES) card.classList.remove('s-' + s);
+  card.classList.add('s-' + status);
+  if (card._chip) {
+    card._chip.className = 'chip s-' + status;
+    card._chip.textContent = status;
+  }
+}
+
+function toolCard(b, ctx) {
   const status = b.status === 'pending' ? 'queued' : (b.status || (b.is_error ? 'failed' : 'completed'));
-  const card = el('div', 'card tool s-' + status);
+  const card = el('div', 'card tool');
   const head = el('button', 'card-head');
   head.type = 'button';
-  head.append(el('span', 'chip s-' + status, status), el('span', 'card-name', b.name || 'tool'));
+  card._chip = el('span', 'chip');
+  head.append(card._chip, el('span', 'card-name', b.name || 'tool'));
   const body = el('div', 'card-body');
   body.append(el('div', 'card-label', 'input'), codeText(json(b.input === undefined ? null : b.input)));
   card.append(head, body);
   collapsible(card, head, body, 'tool:' + (b.id || b.name + ':' + status));
-  if (b.id) cards.set(b.id, card);
+  setStatus(card, status);
+  if (b.id) {
+    ctx.own.set(b.id, card);
+    ctx.cards.set(b.id, card);
+  }
   if (b.output != null) attachResult(card, { content: b.output, is_error: status === 'failed' });
+  else if (b.id) { const r = ctx.results.get(b.id); if (r) attachResult(card, r); }
   return card;
 }
 
-/** Attach a tool_result to the card of its tool_use. */
+/** A result whose tool_use card is absent (other window, refetch gap): a card of its own. */
+function resultCard(b) {
+  const card = el('div', 'card result');
+  const head = el('button', 'card-head');
+  head.type = 'button';
+  card._chip = el('span', 'chip');
+  head.append(card._chip, el('span', 'card-name', 'tool result'));
+  const body = el('div', 'card-body');
+  card.append(head, body);
+  collapsible(card, head, body, 'result:' + (b.tool_use_id || ''));
+  attachResult(card, b);
+  return card;
+}
+
+/** Attach a tool_result to the card of its tool_use. Same content is a no-op. */
 function attachResult(card, b) {
-  card.classList.add('has-res');
-  if (b.is_error) card.classList.add('s-failed');
-  const node = el('div', 'res' + (b.is_error ? ' err' : ''));
-  node.append(el('div', 'card-label', b.is_error ? 'error' : 'result'), preClip(resultText(b.content), b.is_error));
-  card._body.append(node);
+  const text = resultText(b.content);
+  const status = b.is_error ? 'failed' : 'completed';
+  const mark = status + '\n' + text;
+  if (card._res !== mark) {
+    card._res = mark;
+    card._resEl?.remove();
+    setStatus(card, status);
+    card.classList.add('has-res');
+    const node = el('div', 'res' + (b.is_error ? ' err' : ''));
+    node.append(el('div', 'card-label', b.is_error ? 'error' : 'result'), preClip(text, b.is_error));
+    card._body.append(node);
+    card._resEl = node;
+  }
   return document.createComment('result');
 }
 
