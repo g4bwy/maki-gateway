@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d1017">
+<title>maki</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="rail" aria-label="Sessions">
+    <div class="rail-head">
+      <span class="brand">maki</span>
+      <button id="rail-close" class="icon" type="button" aria-label="Close session list">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <ul id="session-list" role="list"></ul>
+  </aside>
+  <div id="scrim" hidden></div>
+
+  <main id="main">
+    <header id="topbar">
+      <button id="rail-toggle" class="icon" type="button" aria-label="Open session list">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <button id="title-btn" class="title" type="button" aria-label="Rename session">No session</button>
+      <span id="kind-chip" class="chip" hidden></span>
+      <span class="spacer"></span>
+      <button id="mode-btn" class="chip mode" type="button" hidden>build</button>
+      <button id="plan-btn" class="icon" type="button" aria-label="Show plan" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16H6zM9 8h6M9 12h6M9 16h4"/></svg>
+      </button>
+      <button id="search-btn" class="icon" type="button" aria-label="Search sessions">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20 20"/></svg>
+      </button>
+      <button id="stats-btn" class="icon" type="button" aria-label="Analytics">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 20V10M12 20V4M19 20v-7"/></svg>
+      </button>
+      <button id="kill-btn" class="icon danger" type="button" aria-label="Kill session" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </header>
+
+    <div id="offline" hidden>
+      <span>Disconnected from the gateway. Retrying.</span>
+      <button id="retry-btn" type="button">Retry now</button>
+    </div>
+
+    <div id="transcript" aria-label="Transcript" tabindex="0"></div>
+
+    <footer id="composer">
+      <div id="readonly" class="chip ro" hidden>read-only transcript</div>
+      <div class="cbox">
+        <textarea id="input" rows="1" placeholder="Message" autocomplete="off"
+          spellcheck="false" aria-label="Message input"></textarea>
+        <button id="cancel-btn" class="icon stop" type="button" aria-label="Stop generation" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1"/></svg>
+        </button>
+        <button id="send-btn" class="icon send" type="button" aria-label="Send message">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V5M6 11l6-6 6 6"/></svg>
+        </button>
+      </div>
+    </footer>
+  </main>
+
+  <button id="fab" type="button" aria-label="New chat">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
+</div>
+
+<div id="overlays"></div>
+<div id="toasts" role="status" aria-live="polite"></div>
+<noscript><p class="nojs">This page needs JavaScript.</p></noscript>
+<script type="module" src="app.js"></script>
+</body>
+</html>
