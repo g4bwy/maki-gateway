@@ -300,6 +300,26 @@ func TestCreateSession(t *testing.T) {
 	}
 }
 
+// TestCreateRequiresCwd: an empty cwd would spawn `maki acp` in whatever
+// directory the gateway itself runs in, so the request is refused instead.
+func TestCreateRequiresCwd(t *testing.T) {
+	acp, att, st := trio()
+	creates := 0
+	acp.createF = func(string, string, string) (string, error) {
+		creates++
+		return "w2", nil
+	}
+	s, _ := newTestServer(t, nil, acp, att, st)
+	for _, body := range []string{`{}`, `{"cwd":""}`, `{"cwd":"   "}`, `{"prompt":"hi"}`} {
+		rec := do(s, "POST", "/api/sessions", body)
+		wantStatus(t, rec, 400)
+		wantBody(t, rec, `{"error":"cwd is required"}`)
+	}
+	if creates != 0 {
+		t.Fatalf("a refused create must not reach the engine, got %d calls", creates)
+	}
+}
+
 func TestDeleteRouting(t *testing.T) {
 	acp, att, st := trio()
 	acp.killF = func(string) error { return nil }

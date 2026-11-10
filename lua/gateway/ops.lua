@@ -340,7 +340,8 @@ function H.ping(_req)
 end
 
 --- The op table conns.lua routes to. Every handler takes (req, entry) and
---- answers (ok, nil) or (nil, message).
+--- answers (value, nil) or (nil, message): the success value is never nil, so
+--- the missing first value means an error to conns.handle_line.
 M.handlers = H
 
 return M

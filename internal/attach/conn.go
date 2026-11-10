@@ -21,6 +21,11 @@ var errGone = errors.New("attach: plugin connection closed")
 // (CONTRACTS 1).
 var errOversizeLine = errors.New("attach: oversized frame")
 
+// errProtocol reports a response frame that carries neither "ok" nor "error".
+// CONTRACTS 1 makes exactly one of them mandatory, so such a frame is a plugin
+// bug and must never look like a success whose payload happens to be empty.
+var errProtocol = errors.New("attach: protocol violation: reply has neither ok nor error")
+
 // reply is one answer, matched to its request by id.
 type reply struct {
 	result json.RawMessage
@@ -125,8 +130,11 @@ func (c *conn) call(ctx context.Context, op string, args map[string]any, out any
 	if err != nil {
 		return err
 	}
-	if out == nil || len(raw) == 0 {
+	if out == nil {
 		return nil
+	}
+	if len(raw) == 0 {
+		return fmt.Errorf("attach: %s: %w", op, errProtocol)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("attach: %s reply: %w", op, err)
@@ -183,6 +191,13 @@ func (c *conn) read() {
 			continue
 		}
 		if m.ID != nil {
+			if !answered(line) {
+				slog.Warn("attach: plugin reply without ok or error, dropping plugin",
+					"socket", c.path, "id", *m.ID)
+				c.reject(*m.ID, errProtocol)
+				reason = errProtocol
+				break
+			}
 			c.deliver(&m)
 			continue
 		}
@@ -195,18 +210,45 @@ func (c *conn) read() {
 
 // deliver hands an answer to its waiter, if anyone still waits.
 func (c *conn) deliver(m *message) {
+	if ch := c.pop(*m.ID); ch != nil {
+		r := reply{result: m.OK}
+		if m.Error != nil {
+			r.err = pluginError(*m.Error)
+		}
+		ch <- r
+	}
+}
+
+// reject fails one waiting request with a fault of the plugin's framing rather
+// than an answer, so the caller learns what broke before the connection dies.
+func (c *conn) reject(id int64, err error) {
+	if ch := c.pop(id); ch != nil {
+		ch <- reply{err: err}
+	}
+}
+
+// pop takes the waiter of one id out of the map, or nil when nobody waits.
+func (c *conn) pop(id int64) chan reply {
 	c.mu.Lock()
-	ch := c.pending[*m.ID]
-	delete(c.pending, *m.ID)
-	c.mu.Unlock()
-	if ch == nil {
-		return
+	defer c.mu.Unlock()
+	ch := c.pending[id]
+	delete(c.pending, id)
+	return ch
+}
+
+// answered reports whether a response frame carries one of the two reply
+// fields. The keys, not their values, decide: "ok":null answers, a bare id
+// answers nothing.
+func answered(line []byte) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(line, &fields); err != nil {
+		return false
 	}
-	r := reply{result: m.OK}
-	if m.Error != nil {
-		r.err = pluginError(*m.Error)
+	_, ok := fields[fieldOK]
+	if !ok {
+		_, ok = fields[fieldErr]
 	}
-	ch <- r
+	return ok
 }
 
 // keepalive pings on its own clock: two misses in a row mean the TUI is gone or

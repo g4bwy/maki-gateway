@@ -235,7 +235,7 @@ func (e *Engine) dial(path string) {
 	h, err := c.hello(ctx)
 	cancel()
 	if err != nil {
-		slog.Debug("attach: hello refused", "socket", path, "error", err)
+		slog.Warn("attach: hello refused", "socket", path, "error", err)
 		c.drop(err)
 		return
 	}
@@ -356,8 +356,11 @@ func (e *Engine) op(session, opName string, args map[string]any, out any) error 
 	if err != nil {
 		return err
 	}
-	if out == nil || len(raw) == 0 {
+	if out == nil {
 		return nil
+	}
+	if len(raw) == 0 {
+		return fmt.Errorf("attach: %s: %w", opName, errProtocol)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("attach: %s reply: %w", opName, err)

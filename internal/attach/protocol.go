@@ -10,6 +10,14 @@ import (
 // {"id","op",...} and reads exactly one {"id","ok"|"error"} back, while the
 // plugin pushes {"event",...} frames with no id at any time.
 
+// fieldOK and fieldErr are the two reply fields of CONTRACTS 1: a response
+// carries exactly one of them, and a response with neither is a protocol
+// violation rather than an empty success.
+const (
+	fieldOK  = "ok"
+	fieldErr = "error"
+)
+
 // message is one frame in either direction. Fields overlap on purpose: one
 // decode covers responses and every event payload we map.
 type message struct {

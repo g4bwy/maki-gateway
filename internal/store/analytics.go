@@ -51,9 +51,11 @@ func (e *Engine) Analytics(days int) (json.RawMessage, error) {
 
 // analytics folds every log's last meta record into per-session totals and
 // per-day buckets, keeping sessions whose meta landed in the last days
-// calendar days (local time, today included). days <= 0 covers all history.
-// Cost comes from meta usage_by_model; logs older than that field fall back to
-// meta token_usage, so they still show their tokens with a zero cost.
+// calendar days (local time, today included).
+// Cost comes from meta usage_by_model. That map is absent until a turn settles,
+// and its cost key is absent for any model without a published price, so the
+// meta token_usage fallback is the normal path: those sessions show their tokens
+// with a zero cost.
 func (e *Engine) analytics(days int) (Analytics, error) {
 	files, err := scanFiles(e.dir)
 	if err != nil {

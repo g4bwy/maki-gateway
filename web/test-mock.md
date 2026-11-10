@@ -62,8 +62,11 @@ Mock sessions: `web-1` (kind web, streaming), `live-1` (kind live, dirty refetch
    a spinner, needs-input amber, exited red, idle a hollow ring.
 8. Each row shows title, relative time, and the last folder of the cwd. The selected
    row is highlighted and marked `aria-current`.
-9. Tap the title, rename it, Save. The rail row and the browser tab title follow.
-   Clear the field and save to go back to the file name.
+9. Tap the title, rename it, Save. Renaming is live-only: on `live-1` the rail row and the
+   browser tab title follow the new name. Clear the field and save to go back to the file name.
+   Against the real gateway a `web` session answers 501, because maki-acp dispatches no
+   `session/set_title`, so the optimistic title rolls back and a toast reports the failure. The
+   mock accepts every rename with 200, so the automated run keeps the new title on `web-1`.
 10. The mode chip is visible for `web-1` and `live-1` only, and flips build/plan.
 11. The plan icon appears only for `live-1`. The drawer shows the plan in markdown.
 12. The Kill icon appears only for a `web` session. It asks first. After Confirm the

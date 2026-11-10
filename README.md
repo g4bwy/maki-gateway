@@ -21,6 +21,9 @@ Wire contracts: `docs/CONTRACTS.md`. Everything else is implementation detail.
 
 Open http://127.0.0.1:8765. Installing the attach plugin: see `lua/gateway/README.md`.
 
+`MAKI_GATEWAY_TOKEN` gates non-loopback binds only. A loopback bind (127.0.0.1, ::1, localhost)
+serves without auth even when that variable is set, so port-forward with care.
+
 ## Status
 
 Prototype. Loopback-only unless `MAKI_GATEWAY_TOKEN` is set (non-loopback bind refuses without it).

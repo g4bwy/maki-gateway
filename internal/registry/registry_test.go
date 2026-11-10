@@ -295,3 +295,93 @@ func TestSessionsCloneAndFind(t *testing.T) {
 		t.Fatal("missing id must not be found")
 	}
 }
+
+// row is one merged web entry; the clock is the volatile part of it.
+func row(title, status string, at int64) model.Session {
+	return model.Session{
+		ID: "w", Kind: model.KindWeb, Title: title, Status: status,
+		Cwd: "/w", Model: "m", UpdatedAt: at, PluginPID: 7,
+	}
+}
+
+func withClock(s model.Session, at int64) model.Session {
+	s.UpdatedAt = at
+	return s
+}
+
+func withTitle(s model.Session, v string) model.Session {
+	s.Title = v
+	return s
+}
+
+func withStatus(s model.Session, v string) model.Session {
+	s.Status = v
+	return s
+}
+
+func withPID(s model.Session, v int) model.Session {
+	s.PluginPID = v
+	return s
+}
+
+// refreshPublishes runs one publishing refresh and reports whether it announced
+// a sessions event, failing on any other event type.
+func refreshPublishes(t *testing.T, r *Registry, sub chan model.Event) bool {
+	t.Helper()
+	r.refresh(true)
+	e, got := recvNow(sub)
+	if got && e.Type != EventTypeSessions {
+		t.Fatalf("want a sessions event, got %+v", e)
+	}
+	return got
+}
+
+// TestRefreshIgnoresUpdatedAtDrift is the SSE storm fix: the merged view carries
+// a clock that moves on its own, and that field alone moving must leave every
+// open tab alone while the stored list still shows the fresh value.
+func TestRefreshIgnoresUpdatedAtDrift(t *testing.T) {
+	web := newFake("acp", row("one", model.StatusWorking, 100))
+	hub := model.NewHub()
+	r := New(hub, web)
+	r.refresh(false)
+	sub := hub.Subscribe()
+	defer hub.Unsubscribe(sub)
+
+	web.set(row("one", model.StatusWorking, 999))
+	if refreshPublishes(t, r, sub) {
+		t.Fatal("a row that only moved its updated_at must not publish")
+	}
+	if list := r.Sessions(); len(list) != 1 || list[0].UpdatedAt != 999 {
+		t.Fatalf("the stored list keeps the real updated_at: %+v", list)
+	}
+
+	web.set(withTitle(row("one", model.StatusWorking, 1000), "renamed"))
+	if !refreshPublishes(t, r, sub) {
+		t.Fatal("a title change must publish")
+	}
+	web.set(withStatus(row("renamed", model.StatusIdle, 1001), model.StatusIdle))
+	if !refreshPublishes(t, r, sub) {
+		t.Fatal("a status change must publish")
+	}
+}
+
+func TestEqualExceptClock(t *testing.T) {
+	base := row("a", model.StatusIdle, 1)
+	cases := []struct {
+		name string
+		a, b []model.Session
+		want bool
+	}{
+		{"same row", []model.Session{base}, []model.Session{base}, true},
+		{"clock only", []model.Session{base}, []model.Session{withClock(base, 9)}, true},
+		{"title", []model.Session{base}, []model.Session{withTitle(base, "b")}, false},
+		{"status", []model.Session{base}, []model.Session{withStatus(base, model.StatusWorking)}, false},
+		{"plugin pid", []model.Session{base}, []model.Session{withPID(base, 3)}, false},
+		{"row added", []model.Session{base}, []model.Session{base, withClock(base, 9)}, false},
+	}
+	for _, c := range cases {
+		if got := equalExceptClock(c.a, c.b); got != c.want {
+			t.Errorf("%s: equalExceptClock = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

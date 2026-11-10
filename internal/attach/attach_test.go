@@ -480,6 +480,52 @@ func TestCloseIsQuietAndIdempotent(t *testing.T) {
 	}
 }
 
+// TestReplyWithoutOkOrErrorFailsAndDropsPlugin pins the framing rule of
+// CONTRACTS 1: exactly one of ok|error. A bare {"id":N} is a plugin bug, so the
+// caller must see a fault rather than a success with no payload, the connection
+// must end, and the refusal must be visible in the log.
+func TestReplyWithoutOkOrErrorFailsAndDropsPlugin(t *testing.T) {
+	var logs safeBuffer
+	restore := warnLog(t, &logs)
+	defer restore()
+
+	f, e, ch := setup(t)
+	f.replyBare(opSetTitle)
+	err := e.SetTitle("s1", "renamed")
+	if err == nil {
+		t.Fatal("a reply with neither ok nor error must fail the request")
+	}
+	if !errors.Is(err, errProtocol) || !strings.Contains(err.Error(), "protocol") {
+		t.Errorf("want a protocol fault, got %v", err)
+	}
+	if ev := wantEvent(t, ch, evNotice); !strings.Contains(ev.Text, "tui disconnected") {
+		t.Errorf("the framing fault must end the connection: %+v", ev)
+	}
+	if !strings.Contains(logs.String(), "reply without ok or error") {
+		t.Errorf("want a warning naming the framing fault, got %q", logs.String())
+	}
+}
+
+func TestHelloRefusalIsWarned(t *testing.T) {
+	var logs safeBuffer
+	restore := warnLog(t, &logs)
+	defer restore()
+
+	dir := t.TempDir()
+	f := newFakeTUI(t, dir, "pid-3.sock", 3)
+	f.failWith(opHello, "plugin is not ready")
+	e, _ := startEngine(t, dir, fastTimings())
+	waitFor(t, "a hello reaching the plugin", func() bool {
+		return slices.Contains(f.opsSeen(), opHello)
+	})
+	if n := e.connCount(); n != 0 {
+		t.Errorf("a plugin that refuses hello is not tracked: %d conns", n)
+	}
+	if !strings.Contains(logs.String(), "hello refused") {
+		t.Errorf("a refused hello must warn: %q", logs.String())
+	}
+}
+
 // connCount is how many plugin sockets the engine holds. Test-side only: the
 // merged session list is the production answer to the same question.
 func (e *Engine) connCount() int {

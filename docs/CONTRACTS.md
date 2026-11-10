@@ -14,9 +14,12 @@ send `hello`. Both sides buffer partial `read()` chunks and split on `\n`; max l
 oversize closes the connection.
 
 Every request: `{"id": <int>, "op": "<name>", ...}`. Exactly one response per id:
-`{"id": N, "ok": <value>}` or `{"id": N, "error": "msg"`. A connection that sent `hello` is
-subscribed to async events for the plugin's lifetime. Events: `{"event": "<name>", ...}`, never
-carry `id`.
+`{"id": N, "ok": <value>}` or `{"id": N, "error": "msg"}`. A response MUST carry exactly one of
+`ok` / `error`. A frame with neither (a bare `{"id": N}`) is a protocol violation: the gateway
+fails that request with an error that names the protocol and closes the connection. It never reads
+such a frame as a success with an empty payload, so a handler has no success answer that carries no
+value. A connection that sent `hello` is subscribed to async events for the plugin's lifetime.
+Events: `{"event": "<name>", ...}`, never carry `id`.
 
 ### ops
 
@@ -67,13 +70,13 @@ All JSON. Base = the bind addr. Static UI served from `/` (files in `web/`).
 |---|---|---|
 | GET /api/health | — | `{"version":str,"maki":str,"sessions":int}` |
 | GET /api/sessions | — | `[Session]` (model.Session JSON, below) |
-| POST /api/sessions | `{"cwd":str,"model"?:str,"prompt"?:str}` | 201 `{"session":id}` — spawns `maki acp` |
+| POST /api/sessions | `{"cwd":str,"model"?:str,"prompt"?:str}` | 201 `{"session":id}` — spawns `maki acp`. Missing or empty `cwd` is 400 `{"error":"cwd is required"}`: the gateway refuses to spawn in its own directory |
 | DELETE /api/sessions/{id} | — | `{"killed":bool}` — kills a **web** process only; 400 for live/stored |
 | GET /api/sessions/{id}/messages?last=200 | — | `{"source":"acp"\|"attach"\|"file","messages":[Message]}` |
 | POST /api/sessions/{id}/prompt | `{"text":str}` | `{"state":"started"\|"queued"}`; 409 `{"error":"busy"}` when a web session is mid-prompt; 409 `"open elsewhere"` on claim clash |
 | POST /api/sessions/{id}/cancel | — | `{"cancelled":bool}`; 501 for live sessions (no plugin API exists yet) |
 | POST /api/sessions/{id}/mode | `{"mode":"build"\|"plan"}` | `{"ok":true}` |
-| POST /api/sessions/{id}/title | `{"title":str\|null}` | `{"ok":true}` |
+| POST /api/sessions/{id}/title | `{"title":str\|null}` | `{"ok":true}`. Rename is live-only: kind `web` answers 501 (`maki-acp` dispatches no `session/set_title`), kind `stored` answers 405 |
 | POST /api/permissions/{engine}/{request_id} | `{"decision":"allow"\|"deny","guidance"?:str}` | `{"ok":true}`; 404 expired. `{engine}` is `"acp"` or `"attach"`; request ids are per-engine counters |
 | GET /api/plan/{id} | — | plan object as in socket `plan` op (web sessions: 501) |
 | GET /api/search?q= | — | `{"hits":[{"session":id,"snippet":str,"title":str}]}` (substring scan of jsonl, cap 50) |
@@ -86,7 +89,7 @@ All JSON. Base = the bind addr. Static UI served from `/` (files in `web/`).
 
 | type | fields | meaning |
 |---|---|---|
-| sessions | — | list changed, refetch GET /api/sessions |
+| sessions | — | list changed, refetch GET /api/sessions. Only a visible change counts: a row whose `updated_at` moved and nothing else raises nothing |
 | update | `session,engine:"acp",event:<raw ACP session/update params>` | web session live stream (chunks, tool cards, usage) |
 | dirty | `session,reason:"turn_end"\|"tool_done"\|"tool_start"\|"status"` | attach session changed: refetch its messages (cheap; no delta events exist in maki) |
 | status | `session,status,title,focused` | merged from both engines |
@@ -96,6 +99,17 @@ All JSON. Base = the bind addr. Static UI served from `/` (files in `web/`).
 | exit | `session,code:int\|null` | web process terminated |
 
 Browser never opens a WebSocket. POST + SSE only (proxy-safe, mobile-safe).
+
+### Search limitations (known in v1)
+
+`GET /api/search` reads the stored engine, and that engine scans raw jsonl lines. Two results
+follow from that. A hit can come from a record no transcript view shows, such as a `frame` or
+`meta` line or a tool result the UI folds away, so a snippet can hold JSON the browser never
+renders. And one hit per session means the 50 hit cap fills in log-name order rather than by
+recency: a query that matches more than 50 logs answers the same 50 sessions every time, and a
+session created after the last of those names can be missing. There is no offset or scope
+parameter. Only when no stored engine is registered does the gateway fall back to a transcript
+scan (message text only, last 200 messages per session).
 
 ### model.Session JSON
 
@@ -126,13 +140,23 @@ grow to 1 MiB when no complete meta found); `maki session list --json` / `export
 `delete <id> --force` are the CLI surface (list writes a scan cache side effect, cwd filter is
 exact-string).
 
-### Attach error substrings (Lua plugin MUST keep these words; gateway maps them, attach.go:436)
+Cost is optional in the shape above, and maki 0.7.1 leaves it out more often than the shape
+suggests. `usage_by_model` only appears once a turn has settled, so a session that never finished
+one carries `token_usage` alone. Each `cost` inside `usage_by_model` is written only for a model
+with a published price: a local or self-hosted model has none, so the key stays away and analytics
+reports its tokens with a zero cost. Treat the `token_usage` fallback as the normal path, not as
+the legacy one. A future maki that prices more models fills both fields, and the same reader code
+covers it.
+
+### Attach error substrings (the Lua plugin MUST keep these words)
 
 `"session not live"`, `"expired"`, `"unknown"`, `"no such"` → 404 · `"another"` / `"elsewhere"`
-→ 409 open elsewhere · `"busy"` → 409 busy. The attach engine sends `{"op":"permissions",
-"on":true}` automatically after `hello`. `list` rows MAY carry `updated_at` (int seconds; the
-engine decodes it when present; live rows otherwise show 0). `focused` is not part of
-model.Session; it travels only on `status` events.
+→ 409 open elsewhere · `"busy"` → 409 busy. The `notLive`, `expired` and `openElsewhere` consts in
+`internal/attach/attach.go` hold the same words, and `MapError` does the mapping. The attach engine
+sends `{"op":"permissions", "on":true}` automatically after `hello`. `list` rows MAY carry
+`updated_at` (int seconds; the engine decodes it when present; live rows otherwise show 0, and the
+gateway does not treat that field as a list change). `focused` is not part of model.Session; it
+travels only on `status` events.
 
 ACP update passthrough (`engine:"acp"`) uses ACP shapes: `sessionUpdate` one of
 `agent_message_chunk|agent_thought_chunk|tool_call|tool_call_update|usage_update|current_mode_update|config_option_update`,

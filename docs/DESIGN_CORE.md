@@ -24,8 +24,10 @@ Consts `PollInterval = 5s`, `Debounce = 250ms`, `EventTypeSessions = "sessions"`
   events filtered by `refreshOn`; defer Unsubscribe. `Refresh()` non-blocking signal.
   `Sessions()` returns slices.Clone. `Find(id)`. `EngineFor(id)` = owner of winning row, fallback
   acp→attach→store. `EngineForKind`, `EngineByName`.
-- `refresh(publish bool)`: merge, json.Marshal, compare to last under RWMutex; publish
-  Event{Type:"sessions"} only on change and only when publish.
+- `refresh(publish bool)`: merge, json.Marshal the full rows into `last`, compare under RWMutex.
+  Replace the stored view whenever that JSON differs, but publish Event{Type:"sessions"} only when
+  the rows differ in a field other than UpdatedAt (a merged clock moves on its own and would
+  announce every poll to every tab) and only when publish is set.
 - `refreshOn(e)`: true for status|dirty|exit; for update|notice true when Reason or raw e.ACP
   contains "turn_end".
 

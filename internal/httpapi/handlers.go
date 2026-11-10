@@ -110,12 +110,19 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &body) {
 		return
 	}
+	// An empty cwd would spawn the process in the gateway's own directory, so
+	// the caller has to say where the session belongs (CONTRACTS 2).
+	cwd := strings.TrimSpace(body.Cwd)
+	if cwd == "" {
+		writeErr(w, http.StatusBadRequest, "cwd is required")
+		return
+	}
 	eng := s.cfg.Registry.EngineForKind(model.KindWeb)
 	if eng == nil {
 		writeErr(w, http.StatusNotImplemented, "no acp engine")
 		return
 	}
-	id, err := eng.Create(body.Cwd, body.Model, body.Prompt)
+	id, err := eng.Create(cwd, body.Model, body.Prompt)
 	if err != nil {
 		writeError(w, err)
 		return

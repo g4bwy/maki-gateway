@@ -176,13 +176,15 @@ function M.handle_line(entry, line)
     M.err(entry, id, "unknown op: " .. name)
     return
   end
-  local called, ok, value = pcall(handler, req, entry)
+  -- Handlers answer (value, nil) or (nil, message), so the first value decides
+  -- the outcome. A raised error is the plugin's own fault and says so.
+  local called, value, err = pcall(handler, req, entry)
   if not called then
-    M.err(entry, id, "plugin error: " .. tostring(ok))
-  elseif ok then
-    M.ok(entry, id, value)
+    M.err(entry, id, "plugin error: " .. tostring(value))
+  elseif value == nil then
+    M.err(entry, id, tostring(err or "failed"))
   else
-    M.err(entry, id, tostring(value or "failed"))
+    M.ok(entry, id, value)
   end
 end
 

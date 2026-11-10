@@ -264,8 +264,28 @@ func (r *Registry) EngineByName(name string) model.Engine {
 	return r.byName[SessionKind(name)]
 }
 
-// refresh re-merges and publishes a sessions event only when the JSON view
-// changed (and publish is set).
+// equalExceptClock compares two merged views on every field a browser can see,
+// ignoring UpdatedAt. That one moves on its own: a plugin row that reports the
+// clock of the poll turned every 5 s tick into a "sessions" event and a refetch
+// per open tab, with nothing to show for it.
+func equalExceptClock(a, b []model.Session) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		x.UpdatedAt, y.UpdatedAt = 0, 0
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
+// refresh re-merges and publishes a sessions event only when the visible view
+// changed (and publish is set). A merged row keeps its real UpdatedAt either
+// way: the diff that decides the announcement ignores it, the stored list does
+// not.
 func (r *Registry) refresh(publish bool) {
 	sessions, owners := mergeEngines(r.engines)
 	data, err := json.Marshal(sessions)
@@ -274,11 +294,12 @@ func (r *Registry) refresh(publish bool) {
 	}
 	r.mu.Lock()
 	changed := !bytes.Equal(r.last, data)
+	visible := changed && !equalExceptClock(r.sessions, sessions)
 	if changed {
 		r.last, r.sessions, r.owners = data, sessions, owners
 	}
 	r.mu.Unlock()
-	if changed && publish {
+	if visible && publish {
 		r.hub.Publish(model.Event{Type: EventTypeSessions})
 	}
 }

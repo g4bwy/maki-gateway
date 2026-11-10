@@ -48,7 +48,8 @@ type (
 		metaBody
 		D *metaBody `json:"d"`
 	}
-	// usage is one model's share of a session (StoredTokenUsage in maki).
+	// usage is one model's share of a session (StoredTokenUsage in maki). Cost is
+	// absent for a model with no published price, which covers every local one.
 	usage struct {
 		Input         int64    `json:"input"`
 		Output        int64    `json:"output"`
@@ -56,8 +57,9 @@ type (
 		CacheRead     int64    `json:"cache_read"`
 		Cost          *float64 `json:"cost"`
 	}
-	// tokenUsage is the older aggregate the log carries next to usage_by_model.
-	// Logs written before per-model accounting have only this.
+	// tokenUsage is the session-wide aggregate the log carries next to
+	// usage_by_model. usage_by_model only appears once a turn has settled, so a
+	// session that never finished one reports this alone.
 	tokenUsage struct {
 		Input          int64 `json:"input_tokens"`
 		Output         int64 `json:"output_tokens"`
@@ -85,7 +87,7 @@ func (l metaLine) body() metaBody {
 }
 
 // totals folds usage_by_model into one row, falling back to the session-wide
-// token_usage when the log predates per-model accounting.
+// token_usage when the log carries no per-model row yet.
 func (m metaBody) totals() usage {
 	if len(m.UsageByModel) == 0 {
 		if m.TokenUsage.Input == 0 && m.TokenUsage.Output == 0 {

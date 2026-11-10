@@ -2,8 +2,10 @@ package attach
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -33,6 +35,7 @@ type fakeTUI struct {
 	answered []int64           // ids the gateway answered
 	frozen   bool              // stop answering ping
 	pending  map[string]string // op -> canned error
+	bare     map[string]bool   // op -> answer {"id":N} with no ok and no error
 	started  string            // what prompt answers
 	closed   bool
 }
@@ -62,7 +65,8 @@ func newFakeTUI(t *testing.T, dir, name string, pid int, tabs ...map[string]any)
 	t.Helper()
 	f := &fakeTUI{
 		t: t, path: filepath.Join(dir, name), pid: pid,
-		parked: map[int64]string{}, pending: map[string]string{}, started: "started",
+		parked: map[int64]string{}, pending: map[string]string{}, bare: map[string]bool{},
+		started: "started",
 	}
 	if len(tabs) > 0 {
 		f.list = tabs
@@ -117,6 +121,7 @@ func (f *fakeTUI) restart() {
 	f.mu.Lock()
 	f.answered, f.frozen = nil, false
 	f.parked, f.pending = map[int64]string{}, map[string]string{}
+	f.bare = map[string]bool{}
 	f.mu.Unlock()
 	f.listen()
 }
@@ -169,6 +174,13 @@ func (f *fakeTUI) serve(c net.Conn) {
 		}
 		f.record(frame)
 		id, _ := frame["id"].(float64)
+		if f.isBare(str(frame["op"])) {
+			// A plugin that broke CONTRACTS 1 framing: one reply field is mandatory.
+			if _, err := c.Write(append([]byte(jsonOf(map[string]any{"id": int64(id)})), '\n')); err != nil {
+				return
+			}
+			continue
+		}
 		ok, fail, hang := f.answer(frame)
 		if hang {
 			continue
@@ -348,6 +360,20 @@ func (f *fakeTUI) failWith(op, msg string) {
 	f.mu.Unlock()
 }
 
+// replyBare makes one op answer {"id":N} with neither ok nor error, which
+// CONTRACTS 1 forbids.
+func (f *fakeTUI) replyBare(op string) {
+	f.mu.Lock()
+	f.bare[op] = true
+	f.mu.Unlock()
+}
+
+func (f *fakeTUI) isBare(op string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.bare[op]
+}
+
 func (f *fakeTUI) answerPromptWith(state string) {
 	f.mu.Lock()
 	f.started = state
@@ -429,4 +455,33 @@ func jsonOf(v any) string {
 		panic(err)
 	}
 	return string(b)
+}
+
+// safeBuffer is a log sink a plugin reader goroutine can write to while the
+// test reads it back.
+type safeBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// warnLog routes the package logger's warnings into buf until the returned
+// func runs. Tests that assert a refusal is visible need it: the default
+// handler drops everything below Error.
+func warnLog(t *testing.T, buf *safeBuffer) func() {
+	t.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	return func() { slog.SetDefault(prev) }
 }
