@@ -164,6 +164,25 @@ func TestEngineLookups(t *testing.T) {
 	}
 }
 
+// TestYoloOnlyChangeIsVisible: a row that differs on nothing but the permission
+// answer must raise a sessions event, which is how a yolo toggle reaches the
+// browser. The diff compares Session with ==, so the field has to stay in the
+// comparison rather than become a pointer or a slice.
+func TestYoloOnlyChangeIsVisible(t *testing.T) {
+	acp := newFake("acp", model.Session{ID: "w", Kind: "web", UpdatedAt: 1})
+	hub := model.NewHub()
+	r := New(hub, acp)
+	r.refresh(false)
+	sub := hub.Subscribe()
+	defer hub.Unsubscribe(sub)
+
+	acp.set(model.Session{ID: "w", Kind: "web", Yolo: true, UpdatedAt: 1})
+	r.refresh(true)
+	if e, got := recvNow(sub); !got || e.Type != EventTypeSessions {
+		t.Fatalf("yolo alone must publish a sessions event, got %+v (%v)", e, got)
+	}
+}
+
 func TestChangeDetectionPublishesOnce(t *testing.T) {
 	acp := newFake("acp", model.Session{ID: "w", Kind: "web", Title: "one", UpdatedAt: 1})
 	hub := model.NewHub()

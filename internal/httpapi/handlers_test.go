@@ -118,6 +118,23 @@ type taskEngine struct {
 
 func (t *taskEngine) Tasks(string) (json.RawMessage, error) { return t.tasksRaw, t.tasksErr }
 
+// yoloEngine is the yoloSetter probe: only the web engine can start its child with
+// another permission answer, so it is a type of its own rather than another
+// fakeEngine method. It records what it was asked for, in order.
+type yoloEngine struct {
+	*fakeEngine
+	setF  func(id string, on bool) error
+	calls []string
+}
+
+func (y *yoloEngine) SetYolo(id string, on bool) error {
+	y.calls = append(y.calls, fmt.Sprintf("%s=%v", id, on))
+	if y.setF == nil {
+		return nil
+	}
+	return y.setF(id, on)
+}
+
 func textMessage(text string) model.Message {
 	return model.Message{Role: "user", Content: json.RawMessage(`[{"type":"text","text":` + jsonEncode(text) + `}]`)}
 }
@@ -190,6 +207,7 @@ func trio() (acp, att, st *fakeEngine) {
 
 func TestAllRoutesResolve(t *testing.T) {
 	acp, att, st := trio()
+	we := &yoloEngine{fakeEngine: acp}
 	acp.promptF = func(string, string) (string, error) { return "started", nil }
 	acp.cancelF = func(string) error { return nil }
 	acp.modeF = func(string, string) error { return nil }
@@ -199,7 +217,7 @@ func TestAllRoutesResolve(t *testing.T) {
 	acp.msgsF = func(string, int) ([]model.Message, error) { return []model.Message{textMessage("m")}, nil }
 	att.msgsF = func(string, int) ([]model.Message, error) { return nil, nil }
 	st.msgsF = func(string, int) ([]model.Message, error) { return nil, model.ErrNotFound }
-	s, _ := newTestServer(t, nil, acp, att, st)
+	s, _ := newTestServer(t, nil, we, att, st)
 
 	cases := []struct {
 		method, path, body string
@@ -213,6 +231,7 @@ func TestAllRoutesResolve(t *testing.T) {
 		{"POST", "/api/sessions/w1/prompt", `{"text":"hi"}`, 200},
 		{"POST", "/api/sessions/w1/cancel", "", 200},
 		{"POST", "/api/sessions/w1/mode", `{"mode":"plan"}`, 200},
+		{"POST", "/api/sessions/w1/yolo", `{"on":true}`, 200},
 		{"POST", "/api/sessions/w1/title", `{"title":"t"}`, 200},
 		{"GET", "/api/search", "", 200},
 		{"GET", "/api/analytics", "", 200},
@@ -683,5 +702,89 @@ func TestAnalytics(t *testing.T) {
 	}
 	if body.PerSession[0].Session != "w1" || body.PerSession[0].Cost != 0 || body.PerSession[0].UpdatedAt != 300 {
 		t.Fatalf("fallback rows = %+v", body.PerSession)
+	}
+}
+
+// notHeld stands for the web engine meeting an id it never spawned: a live tab, or
+// a stored session that a terminal owns.
+func notHeld(string, bool) error { return model.ErrNotFound }
+
+// TestYoloToggleStatuses is the route table of CONTRACTS 2: the web row's answer,
+// the errors that mean try again, the kinds this side cannot reach, and a body that
+// is not a flag.
+func TestYoloToggleStatuses(t *testing.T) {
+	const terminalBody = `{"error":"yolo is a terminal-side toggle for attached sessions"}`
+	cases := []struct {
+		name, id, body string
+		setF           func(string, bool) error
+		want           int
+		wantBody       string
+	}{
+		{"web on", "w1", `{"on":true}`, nil, 200, `{"yolo":true}`},
+		{"web off", "w1", `{"on":false}`, nil, 200, `{"yolo":false}`},
+		{"busy turn", "w1", `{"on":true}`, func(string, bool) error { return model.ErrBusy }, 409, ""},
+		{"still claimed", "w1", `{"on":true}`,
+			func(string, bool) error { return model.ErrOpenElsewhere }, 409, ""},
+		{"web row whose child is gone", "w1", `{"on":true}`, notHeld, 404, ""},
+		{"unknown session", "nope", `{"on":true}`, nil, 404, ""},
+		{"live tab", "l1", `{"on":true}`, notHeld, 501, terminalBody},
+		{"stored session", "s1", `{"on":true}`, notHeld, 501, terminalBody},
+		// The row is stored because the child died, and the engine still holds the
+		// session, so the toggle loads it back rather than refusing.
+		{"stored row this gateway can revive", "s1", `{"on":true}`, nil, 200, `{"yolo":true}`},
+		{"no flag", "w1", `{}`, nil, 400, ""},
+		{"flag that is not a bool", "w1", `{"on":"yes"}`, nil, 400, ""},
+		{"body that is not json", "w1", `yolo`, nil, 400, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			acp, att, st := trio()
+			s, _ := newTestServer(t, nil, &yoloEngine{fakeEngine: acp, setF: c.setF}, att, st)
+			rec := do(s, "POST", "/api/sessions/"+c.id+"/yolo", c.body)
+			wantStatus(t, rec, c.want)
+			if c.wantBody != "" {
+				wantBody(t, rec, c.wantBody)
+			}
+		})
+	}
+}
+
+// TestYoloToggleAsksTheWebEngine pins who is called with what: the flag travels as
+// posted, and only the engine registered for kind web is asked.
+func TestYoloToggleAsksTheWebEngine(t *testing.T) {
+	acp, att, st := trio()
+	we := &yoloEngine{fakeEngine: acp}
+	s, _ := newTestServer(t, nil, we, att, st)
+
+	wantStatus(t, do(s, "POST", "/api/sessions/w1/yolo", `{"on":true}`), 200)
+	wantStatus(t, do(s, "POST", "/api/sessions/w1/yolo", `{"on":false}`), 200)
+	if len(we.calls) != 2 || we.calls[0] != "w1=true" || we.calls[1] != "w1=false" {
+		t.Fatalf("engine saw %v, want w1=true then w1=false", we.calls)
+	}
+
+	// An engine with no toggle cannot be asked for one, and neither can a registry
+	// that has no web engine at all.
+	plain, _ := newTestServer(t, nil, acp, att, st)
+	wantStatus(t, do(plain, "POST", "/api/sessions/w1/yolo", `{"on":true}`), 501)
+	noWeb, _ := newTestServer(t, nil, att, st)
+	wantStatus(t, do(noWeb, "POST", "/api/sessions/l1/yolo", `{"on":true}`), 501)
+}
+
+// TestSessionJSONCarriesYolo is the row shape the browser reads the toggle state
+// from: the field rides on a yolo web row and on nothing else, so an absent field
+// and a plain false both mean the session still asks.
+func TestSessionJSONCarriesYolo(t *testing.T) {
+	acp, att, st := trio()
+	acp.rows[0].Yolo = true
+	s, _ := newTestServer(t, nil, acp, att, st)
+
+	rec := do(s, "GET", "/api/sessions", "")
+	wantStatus(t, rec, 200)
+	body := rec.Body.String()
+	if !strings.Contains(body, `"yolo":true`) {
+		t.Errorf("a yolo web row reported without the field: %s", body)
+	}
+	if strings.Count(body, `"yolo"`) != 1 {
+		t.Errorf("yolo reached a row that has no such answer: %s", body)
 	}
 }

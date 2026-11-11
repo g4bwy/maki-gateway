@@ -28,6 +28,13 @@ type analyst interface {
 	Analytics(days int) (json.RawMessage, error)
 }
 
+// yoloSetter is the web engine's mid-session permission toggle. It is not part of
+// model.Engine, because no other engine can give it: a TUI tab answers with the
+// mode its process started with, and a stored session runs nowhere.
+type yoloSetter interface {
+	SetYolo(id string, on bool) error
+}
+
 // SearchHit is one /api/search result (CONTRACTS 2).
 type SearchHit = model.SearchHit
 
@@ -41,6 +48,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/sessions/{id}/prompt", s.handlePrompt)
 	m.HandleFunc("POST /api/sessions/{id}/cancel", s.handleCancel)
 	m.HandleFunc("POST /api/sessions/{id}/mode", s.handleMode)
+	m.HandleFunc("POST /api/sessions/{id}/yolo", s.handleYolo)
 	m.HandleFunc("POST /api/sessions/{id}/title", s.handleTitle)
 	m.HandleFunc("GET /api/sessions/{id}/tasks", s.handleTasks)
 	m.HandleFunc("POST /api/permissions/{engine}/{request_id}", s.handlePermission)
@@ -331,6 +339,60 @@ func (s *Server) handleTitle(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
+
+// handleYolo answers the mid-session yolo toggle. The flag belongs to the `maki
+// acp` child, which reads it once at startup, so only the web engine can grant it:
+// it respawns that child on the same session. A live tab answers with the mode its
+// TUI started with and a stored session runs nowhere, so both kinds are 501.
+//
+// A row that is not web is still asked, because a web session whose child died
+// leaves a stored row behind while the engine keeps its record, and the toggle
+// revives it. An engine that has never heard of the id answers not-found, and that
+// is the 501 above. For a web row, not-found stays a 404: the row says the session
+// is web, so a missing child is a lost session rather than the wrong terminal.
+func (s *Server) handleYolo(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		On *bool `json:"on"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if body.On == nil {
+		writeErr(w, http.StatusBadRequest, yoloNoFlagText)
+		return
+	}
+	id := r.PathValue("id")
+	row, ok := s.row(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "unknown session")
+		return
+	}
+	eng := s.cfg.Registry.EngineForKind(model.KindWeb)
+	if eng == nil {
+		writeErr(w, http.StatusNotImplemented, "no acp engine")
+		return
+	}
+	setter, ok := eng.(yoloSetter)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "engine has no yolo toggle")
+		return
+	}
+	err := setter.SetYolo(id, *body.On)
+	if err != nil && row.Kind != model.KindWeb && errors.Is(err, model.ErrNotFound) {
+		writeErr(w, http.StatusNotImplemented, yoloTerminalText)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"yolo": *body.On})
+}
+
+const (
+	yoloTerminalText = "yolo is a terminal-side toggle for attached sessions"
+	yoloNoFlagText   = `body needs "on" true or false`
+)
 
 func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 	rid, err := strconv.ParseInt(r.PathValue("request_id"), 10, 64)

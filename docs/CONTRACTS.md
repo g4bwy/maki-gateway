@@ -86,6 +86,7 @@ seeds the session. A loopback bind needs no credential and never sets a cookie.
 | POST /api/sessions/{id}/prompt | `{"text":str}` | `{"state":"started"\|"queued"}`; 409 `{"error":"busy"}` when a web session is mid-prompt; 409 `"open elsewhere"` on claim clash |
 | POST /api/sessions/{id}/cancel | — | `{"cancelled":bool}`; 501 for live sessions (no plugin API exists yet), 404 for stored ones (nothing runs to stop) |
 | POST /api/sessions/{id}/mode | `{"mode":"build"\|"plan"}` | `{"ok":true}` |
+| POST /api/sessions/{id}/yolo | `{"on":bool}` | `{"yolo":bool}`, the answer now in force. Only kind `web` can change it. maki reads `--yolo` once, when the child starts, so no running child can change its mind: the gateway stops that child, starts a new one with or without the flag, and makes it load the same session id, which replays the stored history and continues the chat. A row that reads `stored` because its child died is revived the same way, as long as this gateway still holds the session. 409 `{"error":"busy"}` while a prompt is in flight: the toggle refuses, and that turn keeps running. 404 for an id no engine reports. Kind `live` and kind `stored` answer 501 `{"error":"yolo is a terminal-side toggle for attached sessions"}`. A body with no `"on"` bool is 400. What the toggle costs: every permission dialog the browser still has open is withdrawn (`permission_cancel`), any background work the old child ran dies with it, and the new child starts with the model the session was created with, so a model change made afterwards is undone. The row's `yolo` field and its `status` reach the browser through the `sessions` event, so no new SSE type exists for this. |
 | POST /api/sessions/{id}/title | `{"title":str\|null}` | `{"ok":true}`. Rename is live-only: kind `web` answers 501 (`maki-acp` dispatches no `session/set_title`), kind `stored` answers 405 |
 | POST /api/permissions/{engine}/{request_id} | `{"decision":"allow"\|"allow_always"\|"deny","guidance"?:str}` | `{"ok":true}`, 404 expired, 400 for any other decision. `{engine}` is `"acp"` or `"attach"`, and request ids are per-engine counters. `allow` answers `allow_once` on the ACP wire, `allow_always` answers `allow_always`, and an agent that offers no "always" option gets `allow_once`. The attach bridge has no "always" verdict to give, so `allow_always` arrives as `allow` and only the web engine remembers the answer |
 | GET /api/sessions/{id}/tasks | — | `{"tasks":[TaskInfo]}`, the rows of the socket `tasks` op with the field names of section 1. 501 for kind `web` and kind `stored`, since only a running TUI has tasks. 404 for an id no engine reports |
@@ -125,11 +126,16 @@ scan (message text only, last 200 messages per session).
 
 ### model.Session JSON
 
-`{"id":str,"kind":"web"|"live"|"stored","title":str,"status":"working"|"needs_input"|"idle"|"exited","cwd":str,"model":str,"updated_at":int,"plugin_pid":int?}`
+`{"id":str,"kind":"web"|"live"|"stored","title":str,"status":"working"|"needs_input"|"idle"|"exited","cwd":str,"model":str,"updated_at":int,"plugin_pid":int?,"yolo":bool?}`
 
 `live` entries exist only while the plugin socket lives. A session id present in both stored and
 live lists appears once, `kind:"live"`. Web sessions are also stored (maki persists them); while
-the process lives they appear as `kind:"web"`.
+the process lives they appear as `kind:"web"`, and they stay `kind:"web"` for the moment a yolo
+toggle replaces that process.
+
+`yolo` is the permission answer the web child was started with. Only the acp engine reports it,
+so the field is absent on every other row: absent means false, and an attached tab never tells
+the gateway what mode its terminal chose.
 
 ## 3. Message JSON (native maki shape; what UI renders)
 

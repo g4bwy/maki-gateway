@@ -298,10 +298,11 @@ with the summary line maki shows.
 ```
 
 `start_event_pump` never emits `user_message_chunk`: that variant comes from the
-history replay of `session/load` (`translate.rs:408-418`), which this engine
-never calls. It is still forwarded, because the gateway forwards any
-`session/update` it does not know rather than dropping it. The reducer ignores
-it, so a replay cannot double a message the gateway appended itself.
+history replay of `session/load` (`translate.rs:408-418`), which this engine calls
+only when it replaces a child (§10). It is still forwarded, because the gateway
+forwards any `session/update` it does not know rather than dropping it. The
+reducer ignores it, so a replay cannot double a message the gateway appended
+itself, and the replay window mutes the stream anyway.
 
 ## 6. Agent → client requests on the same stdout
 
@@ -514,9 +515,10 @@ report the death.
   `src/cli.rs:428-435` names both flags, and the order matters: `--yolo` is the
   flag of the `acp` subcommand (`src/cmd/acp.rs:108` reads it), and the global
   flag of the same name (`src/cli.rs:145`) reaches the tui and print paths only,
-  so `maki --yolo acp` starts a session that still asks. The fake records its own
-  argv when `MAKI_FAKE_ARGV` names a file, which is how the tests read these
-  flags back.
+  so `maki --yolo acp` starts a session that still asks. The fake appends its own
+  argv to the file `MAKI_FAKE_ARGV` names, one argument per line and a blank line
+  after each process start, so a test can read one block per child the engine
+  spawned.
 - The child starts with no session. `initialize` then `session/new` run once, in
   that order, inside `Create`, so `Create` returns a usable session id.
 - stdin stays open for the process's life. `Kill` closes it, waits 3 s, then
@@ -524,12 +526,55 @@ report the death.
   the graceful path and the signal is the backstop.
 - stdout EOF or a decode failure is death: every open request is failed, parked
   asks are dropped with `permission_cancel`, and `exit` is published with the
-  wait status. There is no ping, no restart, and no liveness probe.
+  wait status. There is no ping and no liveness probe. The one restart is the yolo
+  toggle below, which replaces the child on purpose rather than after a failure.
 - `Kill` withdraws the parked asks the same way `Cancel` does, with a
   `cancelled` answer and a `permission_cancel` event, before it closes stdin. A
   dialog left open on a killed session has no answer that can still arrive.
 - stderr is forwarded to `slog` at debug, one line per call, prefixed with pid
   and session.
+
+### 10.1 The yolo toggle: one child ends, the next loads the same session
+
+`Engine.SetYolo` is the only caller of `session/load`. Params are
+`LoadSessionRequest { sessionId, cwd, mcpServers }`
+(`schema/v1/agent.rs:1401-1420`, `server.rs:322-397`); all three are required, so
+an empty list is sent the way `session/new` sends one:
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"session/load","params":{"sessionId":"01J8F6...","cwd":"/work","mcpServers":[]}}
+```
+
+```json
+{"jsonrpc":"2.0","id":7,"result":{"modes":{...},"configOptions":[{"id":"model","currentValue":"..."}]}}
+```
+
+The result carries no `sessionId`: the load names the session it opened, and the
+engine keeps the id it already had.
+
+- Order of one attempt: close stdin, wait for the death, start
+  `<makiPath> acp [--yolo] [-m <model>]` with the argv the session was created
+  with, then `initialize` and `session/load`. The claim on the session file is an
+  flock tied to the file description of the dying child, so it is only free once
+  that process is gone. Closing stdin is what flushes an in-flight turn's
+  transcript, which is why nothing harsher is sent for the first 5 s and no kill
+  is ever sent.
+- A load that arrives too early answers `-32000` (§9), so the whole attempt starts
+  over. Ten attempts, 300 ms apart. Past that the session is left as an exited one
+  and the error reaches the caller.
+- The load replays every stored turn as `session/update` notifications *before* it
+  answers (§5). Both the cached transcript and the browser already hold them, so
+  the update stream is muted for the window: no `update` event is published and
+  nothing is fed to the reducer. `session_info_update` and `config_option_update`
+  are still read into the session fields, because they describe the session that
+  was loaded. The alternative, forwarding the replay, would repaint the whole
+  history in every open tab on each toggle.
+- The child's death publishes `exit` while the next one is already starting. That
+  is the death of a process, not of the session: the row stays in `List` through
+  the swap, and the `status` event that follows carries the answer back.
+- The fake refuses a load once when the session cwd holds a file named
+  `@busyload`, and always when its content is `always`, which is how the tests
+  cross that window and how they bound the retries.
 
 ## 11. Transcript reducer, and its limits
 
@@ -557,10 +602,11 @@ to `~/.local/state/maki/sessions/<id>.jsonl`, and the store engine reads that.
 
 Known limits, none of them fixable from this side:
 
-1. The gateway never sees the prompt the model saw, only what the web UI sent,
-   so a turn started in the terminal of the same session is missing from the
-   cache. ACP gives no way to read history back, because `session/load` needs a
-   fresh child, and a fresh child cannot share the session this one holds.
+1. The gateway never sees the prompt the model saw, so a turn started in the
+   terminal of the same session is missing from the cache. `session/load` does
+   bring that history back, but only into a fresh child (§10), and the replay is
+   muted while it arrives, so it reaches neither the cache nor the browser. The
+   gateway reads the stored file instead, through the store engine.
 2. The agent's `sessionId` is maki's own id, so the cached transcript lines up
    with the stored file but is not it. Two views of one session can differ for
    as long as the process lives: web rows win in the merge (CONTRACTS 2).

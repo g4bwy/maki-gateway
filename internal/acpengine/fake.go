@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,11 @@ import (
 //	@exit       die mid-turn without answering, exit status 3
 //	@exitask    park a session/request_permission, then die without answering it
 //	@giant      stream one chunk well past 64 KiB, then end the turn
+//
+// session/load has markers of its own, because a load carries no text: a file
+// named @busyload in the session cwd makes the next load answer -32000 and is
+// removed on the way, standing for the claim a dying child has not released yet.
+// With the content "always" it keeps answering that way.
 type Fake struct {
 	mu         sync.Mutex
 	enc        *json.Encoder
@@ -35,7 +41,8 @@ type Fake struct {
 	answers    chan wireMessage
 }
 
-// Prompt markers the fake reads.
+// Markers the fake reads. All but the two load markers arrive in prompt text; a
+// load carries no text, so those are files inside the session cwd.
 const (
 	FakePermission  = "@permission"
 	FakeAsk         = "@ask"
@@ -49,16 +56,25 @@ const (
 	FakeNoAlways    = "@noalways"
 	FakeSessionStem = "fake-"
 
+	// FakeBusyLoad names the file that makes session/load answer -32000 once,
+	// which is what a session whose previous child has not released its claim
+	// yet looks like to a respawning client. FakeBusyLoadAlways is the file
+	// content that keeps answering that way.
+	FakeBusyLoad       = "@busyload"
+	FakeBusyLoadAlways = "always"
+
 	fakeRejectDetail  = "a prompt is already running"
 	fakeElsewhereText = "session held by another maki"
+	fakeReplayText    = "replayed turn"
 	fakeToolID        = "call-1"
 	fakeExitStatus    = 3
 )
 
-// FakeArgvEnv names a file the fake writes the arguments it was spawned with to,
-// one per line. A test that must see the argv the engine passed sets it: the
-// child inherits the environment, and the file is written before the handshake
-// answers, so a Create that returned can always read it back.
+// FakeArgvEnv names a file the fake appends the arguments it was spawned with to,
+// one argument per line and a blank line after each process start. A test that must
+// see the argv the engine passed sets it: the child inherits the environment, and
+// the file is written before the handshake answers, so a Create that returned can
+// always read it back. A respawn appends, so the file holds one block per child.
 const FakeArgvEnv = "MAKI_FAKE_ARGV"
 
 func recordArgv() {
@@ -66,7 +82,13 @@ func recordArgv() {
 	if path == "" || len(os.Args) < 2 {
 		return
 	}
-	_ = os.WriteFile(path, []byte(strings.Join(os.Args[1:], "\n")), 0o600)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	// One Write per process start, so two children cannot interleave their lines.
+	_, _ = f.WriteString(strings.Join(os.Args[1:], "\n") + "\n\n")
 }
 
 // NewFake writes frames to w. r is read by Serve, so it is not kept here.
@@ -137,6 +159,8 @@ func (f *Fake) handle(m *wireMessage) {
 		})
 	case methodSessionPrompt:
 		f.handlePrompt(m)
+	case methodSessionLoad:
+		f.handleLoad(m)
 	case methodSessionSetMode:
 		var req struct {
 			SessionID string `json:"sessionId"`
@@ -175,6 +199,62 @@ func (f *Fake) collect(m wireMessage) {
 // test are still two distinct sessions.
 func (f *Fake) sessionID() string {
 	return FakeSessionStem + strconv.Itoa(os.Getpid())
+}
+
+// handleLoad answers session/load the way the server does: the whole stored
+// history arrives as updates before the response, and a session whose previous
+// child has not released its claim is refused with -32000.
+//
+// The refusal is asked for by FakeBusyLoad, a file in the session cwd. It is
+// removed as it is read, so the next load of that session succeeds, unless its
+// content is FakeBusyLoadAlways, which keeps refusing.
+func (f *Fake) handleLoad(m *wireMessage) {
+	var req struct {
+		SessionID  string `json:"sessionId"`
+		Cwd        string `json:"cwd"`
+		MCPServers *[]any `json:"mcpServers"`
+	}
+	// sessionId, cwd and mcpServers are all required by the schema
+	// (agent.rs:1401), so a request missing one is a client bug, not a load miss.
+	if err := json.Unmarshal(m.Params, &req); err != nil || req.SessionID == "" || req.MCPServers == nil {
+		f.replyError(m.ID, codeInvalidRequest, "invalid session/load params")
+		return
+	}
+	if held(req.Cwd) {
+		f.replyError(m.ID, codeAuthOrBusy, fakeElsewhereText)
+		return
+	}
+	// The replay, in the session the client named rather than the one this process
+	// would give itself. A reducer that is not muted for the call appends these to
+	// a transcript that already holds them.
+	f.update(req.SessionID, chunk(updateMessageChunk, fakeReplayText))
+	f.update(req.SessionID, chunk(updateThoughtChunk, fakeReplayText))
+	f.reply(m.ID, map[string]any{
+		"modes": map[string]any{
+			"currentModeId": modeBuild,
+			"availableModes": []map[string]string{
+				{"id": modeBuild, "name": "Build"},
+				{"id": modePlan, "name": "Plan"},
+			},
+		},
+		"configOptions": []configOption{{ID: optionModel, CurrentValue: "fake/model"}},
+	})
+}
+
+// held reports whether this cwd asked to refuse one load, and takes the request
+// away so the next one is answered.
+func held(cwd string) bool {
+	path := filepath.Join(cwd, FakeBusyLoad)
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	keep, err := os.ReadFile(path)
+	if err == nil && string(keep) == FakeBusyLoadAlways {
+		return true
+	}
+	_ = os.Remove(path)
+	return true
 }
 
 // handlePrompt mirrors the server: one open id per session, taken under the lock,

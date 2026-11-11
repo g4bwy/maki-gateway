@@ -128,13 +128,23 @@ func newTestEngine(t *testing.T) (*Engine, *collector) {
 
 func create(t *testing.T, eng *Engine) string {
 	t.Helper()
-	id, err := eng.Create(model.CreateRequest{Cwd: t.TempDir(), Model: "fake/model"})
+	return createIn(t, eng, t.TempDir())
+}
+
+// createIn opens a web session in a directory the test already owns, so a marker
+// placed there is one the fake child can act on.
+func createIn(t *testing.T, eng *Engine, dir string) string {
+	t.Helper()
+	id, err := eng.Create(model.CreateRequest{Cwd: dir, Model: "fake/model"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	t.Cleanup(func() { _ = eng.Kill(id) })
 	return id
 }
+
+// eventDrain is how long a test waits to prove an event never came.
+const eventDrain = 300 * time.Millisecond
 
 // blocks decodes one message's content array into plain maps.
 func blocks(t *testing.T, msg model.Message) []map[string]any {
@@ -660,14 +670,41 @@ func TestCancelAnswersTheParkedAsk(t *testing.T) {
 	}
 }
 
-// spawnedArgv reads back the arguments the fake recorded for its own process.
-func spawnedArgv(t *testing.T, path string) []string {
+// spawnArgvs reads back the arguments the fake recorded, one entry per child it
+// was started as, in the order they started.
+func spawnArgvs(t *testing.T, path string) [][]string {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read recorded argv: %v", err)
 	}
-	return strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	var out [][]string
+	for _, block := range strings.Split(string(raw), "\n\n") {
+		if block == "" {
+			continue
+		}
+		out = append(out, strings.Split(strings.TrimSuffix(block, "\n"), "\n"))
+	}
+	return out
+}
+
+// onlySpawn is the one-child case, which is also the claim that nothing respawned.
+func onlySpawn(t *testing.T, path string) []string {
+	t.Helper()
+	argvs := spawnArgvs(t, path)
+	if len(argvs) != 1 {
+		t.Fatalf("%d children were spawned, want 1: %v", len(argvs), argvs)
+	}
+	return argvs[0]
+}
+
+// spawnDir is a temp dir plus the file the fake records its argv in.
+func spawnDir(t *testing.T) (dir, argvPath string) {
+	t.Helper()
+	dir = t.TempDir()
+	argvPath = filepath.Join(dir, "argv")
+	t.Setenv(FakeArgvEnv, argvPath)
+	return
 }
 
 // TestCreateYoloPassesTheFlag is the argv check for yolo web sessions. The flag
@@ -675,9 +712,7 @@ func spawnedArgv(t *testing.T, path string) []string {
 // --yolo only on the tui and print paths (src/cmd/acp.rs:108 takes the
 // subcommand field), which would make `maki --yolo acp` a silent no-op.
 func TestCreateYoloPassesTheFlag(t *testing.T) {
-	dir := t.TempDir()
-	argvPath := filepath.Join(dir, "argv")
-	t.Setenv(FakeArgvEnv, argvPath)
+	dir, argvPath := spawnDir(t)
 
 	eng, _ := newTestEngine(t)
 	id, err := eng.Create(model.CreateRequest{Cwd: dir, Model: "fake/model", Yolo: true})
@@ -686,7 +721,7 @@ func TestCreateYoloPassesTheFlag(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = eng.Kill(id) })
 
-	args := spawnedArgv(t, argvPath)
+	args := onlySpawn(t, argvPath)
 	if len(args) < 2 || args[0] != argACP || args[1] != argYolo {
 		t.Fatalf("spawned %v, want %q first and %q next", args, argACP, argYolo)
 	}
@@ -698,9 +733,7 @@ func TestCreateYoloPassesTheFlag(t *testing.T) {
 // TestCreateWithoutYoloPassesNoFlag: yolo is opt-in per request, and a plain
 // create must still park every prompt.
 func TestCreateWithoutYoloPassesNoFlag(t *testing.T) {
-	dir := t.TempDir()
-	argvPath := filepath.Join(dir, "argv")
-	t.Setenv(FakeArgvEnv, argvPath)
+	dir, argvPath := spawnDir(t)
 
 	eng, _ := newTestEngine(t)
 	id, err := eng.Create(model.CreateRequest{Cwd: dir, Model: "fake/model"})
@@ -709,8 +742,326 @@ func TestCreateWithoutYoloPassesNoFlag(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = eng.Kill(id) })
 
-	if args := spawnedArgv(t, argvPath); slices.Contains(args, argYolo) {
+	if args := onlySpawn(t, argvPath); slices.Contains(args, argYolo) {
 		t.Fatalf("spawned %v, want no %q", args, argYolo)
+	}
+}
+
+// all collects every event the hub sends within d, so a test can also assert that
+// something never arrived.
+func (c *collector) all(d time.Duration) []model.Event {
+	deadline := time.After(d)
+	for {
+		select {
+		case e := <-c.sub:
+			c.events = append(c.events, e)
+		case <-deadline:
+			return c.events
+		}
+	}
+}
+
+// TestCreateRecordsYoloForTheList: the row a browser sees has to carry the answer
+// the child was started with, or its toggle chip starts out wrong.
+func TestCreateRecordsYoloForTheList(t *testing.T) {
+	eng, _ := newTestEngine(t)
+	on, err := eng.Create(model.CreateRequest{Cwd: t.TempDir(), Yolo: true})
+	if err != nil {
+		t.Fatalf("Create yolo: %v", err)
+	}
+	off, err := eng.Create(model.CreateRequest{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Create plain: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Kill(on); _ = eng.Kill(off) })
+
+	list, err := eng.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := map[string]bool{}
+	for _, s := range list {
+		got[s.ID] = s.Yolo
+	}
+	if !got[on] || got[off] {
+		t.Fatalf("yolo rows = %v, want %s on and %s off", got, on, off)
+	}
+}
+
+// transcriptDump renders the cached transcript, for a before and after compare.
+func transcriptDump(t *testing.T, eng *Engine, id string) string {
+	t.Helper()
+	raw, err := json.Marshal(one(t, eng, id))
+	if err != nil {
+		t.Fatalf("marshal transcript: %v", err)
+	}
+	return string(raw)
+}
+
+// carriesReplay reports whether any collected event holds the turn the fake
+// replays on a load. Neither the transcript reducer nor the browser may see it:
+// both already hold that history.
+func carriesReplay(evts []model.Event) bool {
+	for _, e := range evts {
+		if e.Type == "update" && strings.Contains(string(e.ACP), fakeReplayText) {
+			return true
+		}
+	}
+	return false
+}
+
+// rowFor reads one session out of the engine's own list.
+func rowFor(t *testing.T, eng *Engine, id string) (model.Session, bool) {
+	t.Helper()
+	list, err := eng.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, s := range list {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return model.Session{}, false
+}
+
+// heldSession writes the load marker a fake child needs to answer -32000 once.
+func heldSession(t *testing.T, dir, keep string) {
+	t.Helper()
+	path := filepath.Join(dir, FakeBusyLoad)
+	if err := os.WriteFile(path, []byte(keep), 0o600); err != nil {
+		t.Fatalf("write load marker: %v", err)
+	}
+}
+
+// TestSetYoloTurnsItOn respawns an idle session's child with the flag, on the same
+// session: the transcript cache keeps what it held, the replayed history reaches
+// neither the cache nor the browser, the row reports the new answer with its cwd
+// and model intact, and the next prompt runs on the new child.
+func TestSetYoloTurnsItOn(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	eng, c := newTestEngine(t)
+	id := createIn(t, eng, dir)
+
+	if _, err := eng.Prompt(id, "hi"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	waitStatus(t, eng, id, model.StatusIdle)
+	before := transcriptDump(t, eng, id)
+
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo on: %v", err)
+	}
+
+	argvs := spawnArgvs(t, argvPath)
+	if len(argvs) != 2 {
+		t.Fatalf("%d children, want 2 (the respawn): %v", len(argvs), argvs)
+	}
+	if slices.Contains(argvs[0], argYolo) {
+		t.Errorf("first spawn = %v, want no %q", argvs[0], argYolo)
+	}
+	if len(argvs[1]) < 2 || argvs[1][0] != argACP || argvs[1][1] != argYolo {
+		t.Errorf("respawn = %v, want %q right after %q", argvs[1], argYolo, argACP)
+	}
+	if i := slices.Index(argvs[1], argModel); i < 0 || i+1 >= len(argvs[1]) || argvs[1][i+1] != "fake/model" {
+		t.Errorf("respawn = %v, want the model the session was created with", argvs[1])
+	}
+	if carriesReplay(c.all(eventDrain)) {
+		t.Error("a replayed turn reached the browser during the load")
+	}
+	if got := transcriptDump(t, eng, id); got != before {
+		t.Errorf("transcript changed across the load:\n before %s\n after  %s", before, got)
+	}
+
+	row, ok := rowFor(t, eng, id)
+	if !ok {
+		t.Fatal("the session left the list during the toggle")
+	}
+	if !row.Yolo || row.Kind != model.KindWeb || row.Cwd != dir || row.Status != model.StatusIdle {
+		t.Fatalf("row = %+v, want web/idle in %s with yolo on", row, dir)
+	}
+
+	if _, err := eng.Prompt(id, "again on the new child"); err != nil {
+		t.Fatalf("Prompt after the respawn: %v", err)
+	}
+	waitStatus(t, eng, id, model.StatusIdle)
+	if got := transcriptDump(t, eng, id); got == before {
+		t.Error("the turn after the respawn left no trace in the transcript")
+	}
+	if !strings.Contains(transcriptDump(t, eng, id), "again on the new child") {
+		t.Error("the turn after the respawn is not in the transcript")
+	}
+
+	// A second load of the same session has nothing left to do.
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo on again: %v", err)
+	}
+	if argvs := spawnArgvs(t, argvPath); len(argvs) != 2 {
+		t.Fatalf("toggling to the answer it already has respawned: %v", argvs)
+	}
+}
+
+// TestSetYoloTurnsItOff is the other direction: the new child must not carry the
+// flag, which is the only way it starts asking again.
+func TestSetYoloTurnsItOff(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	eng, _ := newTestEngine(t)
+	id, err := eng.Create(model.CreateRequest{Cwd: dir, Model: "fake/model", Yolo: true})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Kill(id) })
+
+	if err := eng.SetYolo(id, false); err != nil {
+		t.Fatalf("SetYolo off: %v", err)
+	}
+	argvs := spawnArgvs(t, argvPath)
+	if len(argvs) != 2 {
+		t.Fatalf("%d children, want 2: %v", len(argvs), argvs)
+	}
+	if !slices.Contains(argvs[0], argYolo) {
+		t.Errorf("first spawn = %v, want %q", argvs[0], argYolo)
+	}
+	if slices.Contains(argvs[1], argYolo) {
+		t.Errorf("respawn = %v, want no %q", argvs[1], argYolo)
+	}
+	row, ok := rowFor(t, eng, id)
+	if !ok || row.Yolo {
+		t.Fatalf("row = %+v (%v), want yolo off", row, ok)
+	}
+}
+
+// TestSetYoloRefusesToCutATurnShort: a running prompt is not interrupted. The
+// child keeps the flag it has, and no process is replaced.
+func TestSetYoloRefusesToCutATurnShort(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	eng, c := newTestEngine(t)
+	id := createIn(t, eng, dir)
+
+	if _, err := eng.Prompt(id, "hold "+FakeHold); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	c.next(t, 10*time.Second, ofUpdate(updateMessageChunk))
+
+	if err := eng.SetYolo(id, true); !errors.Is(err, model.ErrBusy) {
+		t.Fatalf("SetYolo mid-turn err = %v, want ErrBusy", err)
+	}
+	onlySpawn(t, argvPath)
+
+	// The turn is still the one that was running: the toggle left it alone.
+	if err := eng.Cancel(id); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	waitStatus(t, eng, id, model.StatusIdle)
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo once idle: %v", err)
+	}
+	if argvs := spawnArgvs(t, argvPath); len(argvs) != 2 {
+		t.Fatalf("%d children after the turn ended, want 2: %v", len(argvs), argvs)
+	}
+}
+
+// TestSetYoloRerespawnWhileTheSessionIsClaimed covers the flock window: the child
+// that is dying holds the session file until it is gone, so the first fresh child
+// is answered -32000 and the whole attempt starts over.
+func TestSetYoloRerespawnWhileTheSessionIsClaimed(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	heldSession(t, dir, "")
+	eng, _ := newTestEngine(t)
+	eng.yoloRetryWait = 10 * time.Millisecond
+	id := createIn(t, eng, dir)
+
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo after one refused load: %v", err)
+	}
+	argvs := spawnArgvs(t, argvPath)
+	if len(argvs) != 3 {
+		t.Fatalf("%d children, want 3 (create, refused load, loaded): %v", len(argvs), argvs)
+	}
+	for _, args := range argvs[1:] {
+		if !slices.Contains(args, argYolo) {
+			t.Errorf("respawn %v, want %q", args, argYolo)
+		}
+	}
+	if row, ok := rowFor(t, eng, id); !ok || !row.Yolo {
+		t.Fatalf("row = %+v (%v), want the session back with yolo on", row, ok)
+	}
+	if _, err := eng.Prompt(id, "still working"); err != nil {
+		t.Fatalf("Prompt after the retry: %v", err)
+	}
+}
+
+// TestSetYoloGivesUpOnAPermanentClaim bounds the retry loop: a session that never
+// frees is reported as it is, open elsewhere, and the record is left exited with
+// its transcript.
+func TestSetYoloGivesUpOnAPermanentClaim(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	heldSession(t, dir, FakeBusyLoadAlways)
+	eng, c := newTestEngine(t)
+	eng.yoloRetries = 2
+	eng.yoloRetryWait = 10 * time.Millisecond
+	id := createIn(t, eng, dir)
+	if _, err := eng.Prompt(id, "hi"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	waitStatus(t, eng, id, model.StatusIdle)
+	before := transcriptDump(t, eng, id)
+
+	err := eng.SetYolo(id, true)
+	if !errors.Is(err, model.ErrOpenElsewhere) {
+		t.Fatalf("SetYolo err = %v, want ErrOpenElsewhere", err)
+	}
+	// One create plus one child per attempt, and no third.
+	if argvs := spawnArgvs(t, argvPath); len(argvs) != 3 {
+		t.Fatalf("%d children, want 3 (create and %d attempts): %v", len(argvs), eng.yoloRetries, argvs)
+	}
+	if _, ok := rowFor(t, eng, id); ok {
+		t.Error("the row is still listed after the respawn gave up")
+	}
+	c.next(t, 10*time.Second, ofType("exit"))
+	if got := transcriptDump(t, eng, id); got != before {
+		t.Errorf("a failed respawn rewrote the transcript:\n before %s\n after  %s", before, got)
+	}
+}
+
+// TestSetYoloRevivesAnExitedSession is the reason an exited row is not an error:
+// the session is stored, a fresh child loads it back, and the chat continues with
+// the answer the toggle asked for.
+func TestSetYoloRevivesAnExitedSession(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	eng, c := newTestEngine(t)
+	id := createIn(t, eng, dir)
+
+	if _, err := eng.Prompt(id, FakeExit); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	c.next(t, 10*time.Second, ofType("exit"))
+	if _, ok := rowFor(t, eng, id); ok {
+		t.Fatal("a dead child is still listed as live")
+	}
+
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo on an exited session: %v", err)
+	}
+	argvs := spawnArgvs(t, argvPath)
+	if len(argvs) != 2 || !slices.Contains(argvs[1], argYolo) {
+		t.Fatalf("spawned %v, want a second child with %q", argvs, argYolo)
+	}
+	row, ok := rowFor(t, eng, id)
+	if !ok || !row.Yolo || row.Kind != model.KindWeb {
+		t.Fatalf("row = %+v (%v), want the session back as web with yolo on", row, ok)
+	}
+	if _, err := eng.Prompt(id, "the chat continues"); err != nil {
+		t.Fatalf("Prompt on the revived session: %v", err)
+	}
+	waitStatus(t, eng, id, model.StatusIdle)
+}
+
+// TestSetYoloUnknownSession is the 404 half of the contract.
+func TestSetYoloUnknownSession(t *testing.T) {
+	eng, _ := newTestEngine(t)
+	if err := eng.SetYolo("no-such-session", true); !errors.Is(err, model.ErrNotFound) {
+		t.Fatalf("SetYolo unknown err = %v, want ErrNotFound", err)
 	}
 }
 

@@ -17,6 +17,7 @@ const (
 
 	methodInitialize        = "initialize"
 	methodSessionNew        = "session/new"
+	methodSessionLoad       = "session/load"
 	methodSessionPrompt     = "session/prompt"
 	methodSessionCancel     = "session/cancel"
 	methodSessionSetMode    = "session/set_mode"

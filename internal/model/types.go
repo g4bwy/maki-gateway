@@ -40,6 +40,11 @@ type Session struct {
 	Model     string `json:"model"`
 	UpdatedAt int64  `json:"updated_at"`
 	PluginPID int    `json:"plugin_pid,omitempty"`
+	// Yolo is the permission answer a web child was started with. Only the acp
+	// engine reports it, so the field stays absent for every other row rather
+	// than arriving as a false "the terminal asks". The struct must stay
+	// comparable: the registry diffs rows with ==.
+	Yolo bool `json:"yolo,omitempty"`
 }
 
 // Message is the native maki transcript record (CONTRACTS 3, the "d" of a "t":"msg" line).

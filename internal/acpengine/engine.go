@@ -22,6 +22,15 @@ import (
 	"maki-gateway/internal/model"
 )
 
+const (
+	// A respawn can lose the claim on the session file to the child it is
+	// replacing, since an flock is only free once that process is gone. So the
+	// whole spawn-and-load starts over, this many times, with this long between
+	// attempts.
+	defaultYoloRetries   = 10
+	defaultYoloRetryWait = 300 * time.Millisecond
+)
+
 // Engine is the web engine. It is safe for concurrent use.
 type Engine struct {
 	makiPath string
@@ -30,6 +39,11 @@ type Engine struct {
 
 	mu    sync.Mutex
 	procs map[string]*process
+
+	// How many respawns a held session claim buys, and how long between them.
+	// Fields, so a test can bound the loop it drives.
+	yoloRetries   int
+	yoloRetryWait time.Duration
 
 	parkMu sync.Mutex
 	parkID int64
@@ -54,11 +68,13 @@ var _ model.Engine = (*Engine)(nil)
 // gateway's -maki flag, so tests point it at the fake.
 func New(makiPath string, hub *model.Hub) *Engine {
 	return &Engine{
-		makiPath: makiPath,
-		hub:      hub,
-		log:      slog.Default().With("engine", model.EngineACP),
-		procs:    map[string]*process{},
-		parked:   map[int64]*parkedAsk{},
+		makiPath:      makiPath,
+		hub:           hub,
+		log:           slog.Default().With("engine", model.EngineACP),
+		procs:         map[string]*process{},
+		yoloRetries:   defaultYoloRetries,
+		yoloRetryWait: defaultYoloRetryWait,
+		parked:        map[int64]*parkedAsk{},
 	}
 }
 
@@ -66,9 +82,9 @@ func New(makiPath string, hub *model.Hub) *Engine {
 func (e *Engine) Kind() string { return model.KindWeb }
 
 // Create spawns the child, handshakes, and returns the sessionId the agent
-// chose. A non-empty prompt starts the first turn. req.Yolo passes `--yolo` to
-// the child, so it never asks for permission: the browser only sets it when the
-// person asked to create a session that way.
+// chose. A non-empty prompt starts the first turn. req.Yolo is the permission
+// answer given at creation: it goes to the child as `--yolo`, and the record keeps
+// it, so List reports the same answer SetYolo moves.
 func (e *Engine) Create(req model.CreateRequest) (string, error) {
 	cwd := req.Cwd
 	// session/new demands an absolute cwd (agent.rs:1225), and the browser can
@@ -97,7 +113,8 @@ func (e *Engine) Create(req model.CreateRequest) (string, error) {
 
 // List reports live web sessions. An exited one stays out of the list so the
 // store engine can answer for it, while its cached transcript still serves
-// Messages until Kill drops it.
+// Messages until Kill drops it. A session whose child is being replaced by a yolo
+// toggle keeps its row: the same conversation continues on the next process.
 func (e *Engine) List() ([]model.Session, error) {
 	e.mu.Lock()
 	procs := make([]*process, 0, len(e.procs))
@@ -241,6 +258,97 @@ func (e *Engine) SetModel(id, m string) error {
 	return nil
 }
 
+// SetYolo answers a mid-session yolo toggle for one web session.
+//
+// maki reads the permission answer from the `acp --yolo` flag once, at startup, so
+// the child a session runs on cannot be talked into another mode. What works
+// instead is a new child on the same session: this ends the current one, spawns
+// another with the flag set to match `on`, and asks it to load the session, which
+// replays the stored history and continues the conversation from there. The
+// transcript cache is kept as it was, so the browser sees no gap and no line twice.
+//
+// A session whose child died is revived by the same call, since the record still
+// holds its id and cwd: `on` is applied to the child that loads it back.
+//
+// What it costs the session: every permission dialog the browser still holds is
+// withdrawn, background work of the old child dies with it, and a prompt in flight
+// blocks the toggle with model.ErrBusy rather than being cut short.
+func (e *Engine) SetYolo(id string, on bool) error {
+	e.mu.Lock()
+	p, ok := e.procs[id]
+	e.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("%w: %s", model.ErrNotFound, id)
+	}
+	if reason := p.claimRestart(); reason != "" {
+		return fmt.Errorf("%w: %s", model.ErrBusy, reason)
+	}
+	defer p.releaseRestart()
+	if p.permissionAnswer() == on && !p.isExited() {
+		return nil
+	}
+	if err := e.respawn(p, on); err != nil {
+		// The record stays, and stays out of the list, with its transcript for
+		// whoever reads the session next. Another toggle can retry from here.
+		return err
+	}
+	p.setPermissionAnswer(on)
+	p.setStatus(model.StatusIdle)
+	return nil
+}
+
+// respawn restarts one session's child and reloads the session into it, retrying
+// the whole attempt while the previous child still holds the claim. A failure that
+// is not that race is returned at once: no number of tries fixes a binary that will
+// not start.
+func (e *Engine) respawn(p *process, on bool) error {
+	var last error
+	for attempt := 1; ; attempt++ {
+		last = e.respawnOnce(p, on)
+		if last == nil || !errors.Is(last, model.ErrOpenElsewhere) {
+			return last
+		}
+		if attempt >= e.yoloRetries {
+			break
+		}
+		e.log.Info("session still claimed, retrying", "session", p.Session(),
+			"attempt", attempt, "error", last)
+		time.Sleep(e.yoloRetryWait)
+	}
+	return fmt.Errorf("%w: %s still claimed after %d respawn attempts: %w",
+		model.ErrOpenElsewhere, p.Session(), e.yoloRetries, last)
+}
+
+// respawnOnce is one attempt: end the child, start the next one, load the session.
+// An attempt that cannot load what it started ends that child again, so the next
+// one faces the same clean state, and a session nobody else holds.
+func (e *Engine) respawnOnce(p *process, on bool) error {
+	if !p.halt() {
+		return fmt.Errorf("the acp child of %s would not exit", p.Session())
+	}
+	// Kill deletes the record while the child is going down. Then no new child may
+	// start behind it, and the person who asked for the toggle learns the session is
+	// gone rather than finding a process nothing owns.
+	if !e.owns(p) {
+		return fmt.Errorf("%w: %s", model.ErrNotFound, p.Session())
+	}
+	if err := p.respawnChild(on); err != nil {
+		return err
+	}
+	if err := p.reload(); err != nil {
+		p.stop()
+		return err
+	}
+	return nil
+}
+
+// owns reports whether the engine still maps this session to this record.
+func (e *Engine) owns(p *process) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.procs[p.Session()] == p
+}
+
 // SetTitle is unsupported: maki-acp answers no session/set_title, so the title
 // only ever arrives from the agent as a session_info_update.
 func (e *Engine) SetTitle(string, string) error {
@@ -298,11 +406,16 @@ func (e *Engine) lookup(id string) (*process, bool) {
 }
 
 // live is the guard every call that needs the child takes. A dead one is gone
-// from the caller's point of view even while its transcript cache stays.
+// from the caller's point of view even while its transcript cache stays, and one
+// that is respawning has a child that has not finished loading its session, so
+// nothing may be sent to it yet.
 func (e *Engine) live(id string) (*process, error) {
 	p, ok := e.lookup(id)
 	if !ok || p.isExited() {
 		return nil, fmt.Errorf("%w: %s", model.ErrNotFound, id)
+	}
+	if p.isRestarting() {
+		return nil, fmt.Errorf("%w: session is respawning", model.ErrBusy)
 	}
 	return p, nil
 }
@@ -330,11 +443,14 @@ func (p *process) resumeAfterAsk() {
 	p.setStatus(model.StatusIdle)
 }
 
-// entry renders the list row, or false once the child is gone.
+// entry renders the list row, or false once the child is gone and nothing is
+// taking its place. A child that is being replaced still has a row: the session
+// continues on the next process, and dropping the row for the moment between them
+// would tell the browser the chat ended.
 func (p *process) entry() (model.Session, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.exited || p.session == "" {
+	if p.session == "" || (p.exited && !p.restarting) {
 		return model.Session{}, false
 	}
 	return model.Session{
@@ -345,6 +461,7 @@ func (p *process) entry() (model.Session, bool) {
 		Cwd:       p.cwd,
 		Model:     p.modelName,
 		UpdatedAt: p.updatedAt,
+		Yolo:      p.yolo,
 	}, true
 }
 
