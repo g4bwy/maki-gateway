@@ -931,6 +931,82 @@ func TestSetYoloTurnsItOff(t *testing.T) {
 	}
 }
 
+// TestSetYoloKeepsTheModelTheUserChose is the model half of the toggle. The child
+// reads -m once, at startup, so a respawn that repeats only the create request puts
+// the session back on a model the user left during the chat.
+func TestSetYoloKeepsTheModelTheUserChose(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	eng, c := newTestEngine(t)
+	id, err := eng.Create(model.CreateRequest{Cwd: dir, Model: "model/a"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Kill(id) })
+	if got := onlySpawn(t, argvPath); !slices.Contains(got, "model/a") {
+		t.Fatalf("first spawn = %v, want the model of the create request", got)
+	}
+
+	if err := eng.SetModel(id, "model/b"); err != nil {
+		t.Fatalf("SetModel: %v", err)
+	}
+	c.next(t, 10*time.Second, ofUpdate(updateConfigOption))
+
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo on: %v", err)
+	}
+	argvs := spawnArgvs(t, argvPath)
+	if len(argvs) != 2 {
+		t.Fatalf("%d children, want 2 (the respawn): %v", len(argvs), argvs)
+	}
+	if i := slices.Index(argvs[1], argModel); i < 0 || i+1 >= len(argvs[1]) || argvs[1][i+1] != "model/b" {
+		t.Fatalf("respawn = %v, want the model the user set last after %q", argvs[1], argModel)
+	}
+	if !slices.Contains(argvs[1], argYolo) {
+		t.Errorf("respawn = %v, want %q", argvs[1], argYolo)
+	}
+	// The answer it already has starts nothing, so a second toggle leaves the argv
+	// of the session alone.
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo on again: %v", err)
+	}
+	if argvs := spawnArgvs(t, argvPath); len(argvs) != 2 {
+		t.Fatalf("toggling to the answer it has respawned: %v", argvs)
+	}
+}
+
+// TestSetYoloIgnoresTheModelTheChildReports draws the line the carry-over stops at:
+// a child names a model in its own configOptions on every handshake and every load,
+// and that report is what the list row shows. It is not a choice of the user, so a
+// session created without a model must not grow one from it.
+func TestSetYoloIgnoresTheModelTheChildReports(t *testing.T) {
+	dir, argvPath := spawnDir(t)
+	eng, _ := newTestEngine(t)
+	id, err := eng.Create(model.CreateRequest{Cwd: dir})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Kill(id) })
+	if got := onlySpawn(t, argvPath); slices.Contains(got, argModel) {
+		t.Fatalf("first spawn = %v, want no %q", got, argModel)
+	}
+	// The fake answers every session/new with a model of its own, which is the
+	// report this test must not mistake for a request.
+	if row, ok := rowFor(t, eng, id); !ok || row.Model == "" {
+		t.Fatalf("row = %+v (%v), want the model the child reported", row, ok)
+	}
+
+	if err := eng.SetYolo(id, true); err != nil {
+		t.Fatalf("SetYolo on: %v", err)
+	}
+	argvs := spawnArgvs(t, argvPath)
+	if len(argvs) != 2 {
+		t.Fatalf("%d children, want 2 (the respawn): %v", len(argvs), argvs)
+	}
+	if slices.Contains(argvs[1], argModel) {
+		t.Errorf("respawn = %v, want no %q: a reported model is not a chosen one", argvs[1], argModel)
+	}
+}
+
 // TestSetYoloRefusesToCutATurnShort: a running prompt is not interrupted. The
 // child keeps the flag it has, and no process is replaced.
 func TestSetYoloRefusesToCutATurnShort(t *testing.T) {
@@ -1092,6 +1168,44 @@ func TestFailedTurnNotice(t *testing.T) {
 	})
 	if noticed.Session != id || noticed.Engine != model.EngineACP {
 		t.Fatalf("notice = %+v", noticed)
+	}
+}
+
+// TestMapWireErrorCodes is the table the web engine answers with, and the one row
+// that was missing from it: an agent that has no such session says so with -32002,
+// which is a plain answer about the session rather than a gateway fault, so the
+// browser must see 404 and not 500.
+func TestMapWireErrorCodes(t *testing.T) {
+	const missingText = "Session not found: 01J8NOSESSION"
+	cases := []struct {
+		name string
+		in   wireError
+		want error
+	}{
+		{"busy_prompt", wireError{Code: codeInternal, Message: busyPromptText}, model.ErrBusy},
+		{"held_elsewhere", wireError{Code: codeAuthOrBusy, Message: fakeElsewhereText}, model.ErrOpenElsewhere},
+		{"no_active_session", wireError{Code: codeInvalidRequest}, model.ErrNotFound},
+		{"session_not_found", wireError{Code: codeNotFound, Message: missingText}, model.ErrNotFound},
+		{"child_gone", wireError{Code: codeGone, Message: "the child died"}, errGone},
+	}
+	for _, c := range cases {
+		in := c.in
+		got := mapWireError(&in)
+		if !errors.Is(got, c.want) {
+			t.Errorf("%s: err = %v, want %v", c.name, got, c.want)
+		}
+	}
+	// The agent's own sentence travels with the sentinel, because it is the only
+	// part of the answer that names the session the user clicked.
+	in := wireError{Code: codeNotFound, Message: missingText}
+	if got := mapWireError(&in); !strings.Contains(got.Error(), missingText) {
+		t.Errorf("not-found error = %q, want it to quote %q", got, missingText)
+	}
+	// A code with no gateway meaning stays the wire error rather than becoming a
+	// not-found guess.
+	other := wireError{Code: codeMethodNotFound, Message: "method not found"}
+	if got := mapWireError(&other); !errors.Is(got, &other) {
+		t.Errorf("method-not-found: err = %v (%T), want the wire error itself", got, got)
 	}
 }
 

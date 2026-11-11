@@ -74,6 +74,11 @@ const (
 	codeInternal       = -32603
 	codeAuthOrBusy     = -32000
 
+	// codeNotFound is the schema's resource_not_found: the agent has no session
+	// under the id a method named (`server.rs:331,742`). It is a plain answer to a
+	// request for a chat that is gone, so it is not a gateway fault.
+	codeNotFound = -32002
+
 	// codeGone is not a JSON-RPC code. It labels only a reply this package
 	// synthesizes when the child died before answering.
 	codeGone = 1
@@ -146,6 +151,10 @@ func (m *wireMessage) result() (json.RawMessage, error) {
 // provider rejection with the same number (server.rs:1090), and the only place
 // that reaches a caller is a turn that dies inside the admission wait. The
 // notice always quotes the agent, so the user reads the real reason either way.
+//
+// -32002 is the agent saying it has no such session. Before that case existed a
+// prompt or a load of an id the child never opened reached the browser as a 500,
+// which reads as a broken gateway rather than as a chat that has ended.
 func mapWireError(e *wireError) error {
 	switch {
 	case e.Code == codeInternal && strings.Contains(e.Message, busyPromptText):
@@ -154,6 +163,8 @@ func mapWireError(e *wireError) error {
 		return model.ErrOpenElsewhere
 	case e.Code == codeInvalidRequest:
 		return fmt.Errorf("%w: no active session", model.ErrNotFound)
+	case e.Code == codeNotFound:
+		return fmt.Errorf("%w: %s", model.ErrNotFound, e.Message)
 	case e.Code == codeGone:
 		return errGone
 	default:

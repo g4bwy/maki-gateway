@@ -20,6 +20,19 @@ type tasker interface {
 	Tasks(id string) (json.RawMessage, error)
 }
 
+// focuser is the attach engine's follow action. No other engine has a screen to
+// move: a web child draws no chat, and a stored session runs nowhere.
+type focuser interface {
+	FocusTask(session, taskID string) error
+}
+
+// taskReader is the store engine's read of one task's transcript. The session log
+// is the only source, which is what lets a live tab, a web child and a stored
+// session answer the same way.
+type taskReader interface {
+	SubMessages(sessionID, taskID string, last int) ([]json.RawMessage, error)
+}
+
 type searcher interface {
 	Search(q string, limit int) ([]SearchHit, error)
 }
@@ -51,6 +64,8 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/sessions/{id}/yolo", s.handleYolo)
 	m.HandleFunc("POST /api/sessions/{id}/title", s.handleTitle)
 	m.HandleFunc("GET /api/sessions/{id}/tasks", s.handleTasks)
+	m.HandleFunc("GET /api/sessions/{id}/tasks/{tid}/messages", s.handleTaskMessages)
+	m.HandleFunc("POST /api/sessions/{id}/tasks/{tid}/focus", s.handleTaskFocus)
 	m.HandleFunc("POST /api/permissions/{engine}/{request_id}", s.handlePermission)
 	m.HandleFunc("GET /api/plan/{id}", s.handlePlan)
 	m.HandleFunc("GET /api/search", s.handleSearch)
@@ -503,6 +518,66 @@ const (
 	snippetBefore = 40
 	snippetAfter  = 120
 )
+
+// followLiveText is the answer of the focus route for every kind but a live one.
+const followLiveText = "follow is a live-session action"
+
+// handleTaskMessages answers one task's transcript out of the session log, so a
+// live tab, a web child and a stored session all read the same source and none of
+// them has to be alive. An unknown session id is a missing file, which is a 404.
+//
+// A task that is still running has no transcript to give: maki keeps a sub-agent's
+// messages in memory and appends them together when the run ends. That empty list
+// is the truth at this moment rather than a promise about later, so the body says
+// nothing else and the browser refetches on the next `tasks` event.
+func (s *Server) handleTaskMessages(w http.ResponseWriter, r *http.Request) {
+	eng := s.cfg.Registry.EngineForKind(model.KindStored)
+	reader, ok := eng.(taskReader)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "no engine reads session files")
+		return
+	}
+	msgs, err := reader.SubMessages(r.PathValue("id"), r.PathValue("tid"),
+		parseQueryInt(r, "last", defaultLast))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if msgs == nil {
+		msgs = []json.RawMessage{}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Messages []json.RawMessage `json:"messages"`
+	}{msgs})
+}
+
+// handleTaskFocus points the terminal at one chat of a live tab. Following needs
+// a screen, which only an attached TUI has, so web and stored kinds are refused by
+// kind here and the plugin's own refusal words pass through unchanged (404 for a
+// task this tab does not have, 501 for a maki with no interactive UI).
+func (s *Server) handleTaskFocus(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	row, ok := s.row(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "unknown session")
+		return
+	}
+	if row.Kind != model.KindLive {
+		writeErr(w, http.StatusNotImplemented, followLiveText)
+		return
+	}
+	eng := s.cfg.Registry.EngineForKind(row.Kind)
+	f, ok := eng.(focuser)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "engine has no task follow")
+		return
+	}
+	if err := f.FocusTask(id, r.PathValue("tid")); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")

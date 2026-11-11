@@ -11,6 +11,8 @@ Two engines, one merged session list:
   attaches to it (`list`, `prompt`, steer, events, permission bridge).
 - **stored** sessions: read from `~/.local/state/maki/sessions/*.jsonl` (never offset-tail across
   rewrites; only newline-terminated records).
+- **sub-agents**: open any task's transcript from its session log, and follow one of them in the
+  terminal of a live tab.
 
 Wire contracts: `docs/CONTRACTS.md`. Everything else is implementation detail.
 

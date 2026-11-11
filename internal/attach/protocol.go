@@ -21,8 +21,11 @@ const (
 // message is one frame in either direction. Fields overlap on purpose: one
 // decode covers responses and every event payload we map.
 type message struct {
-	// ID is set on a response, absent on an event (CONTRACTS 1).
-	ID    *int64          `json:"id"`
+	// ID is the request number of a response and absent on an event (CONTRACTS 1).
+	// It stays raw because the task_focus event carries a task name in this same
+	// field, and a frame that failed to decode costs the gateway every change it
+	// was reporting. requestID and taskName read the one each kind holds.
+	ID    json.RawMessage `json:"id"`
 	OK    json.RawMessage `json:"ok"`
 	Error *string         `json:"error"`
 
@@ -37,6 +40,26 @@ type message struct {
 	Tool      string          `json:"tool"`
 	RequestID int64           `json:"request_id"`
 	Input     json.RawMessage `json:"input"`
+}
+
+// requestID is the correlation number of a response frame, and false for a frame
+// that carries no number there: an event, or one whose id is a task name.
+func (m *message) requestID() (int64, bool) {
+	if len(m.ID) == 0 {
+		return 0, false
+	}
+	var id int64
+	return id, json.Unmarshal(m.ID, &id) == nil
+}
+
+// taskName is the task id a task_focus frame carries in the `id` field, and "" for
+// a response, whose number there is not a name.
+func (m *message) taskName() string {
+	var name string
+	if json.Unmarshal(m.ID, &name) != nil {
+		return ""
+	}
+	return name
 }
 
 // helloBody is the {"pid","plugin","cwd","sessions"} answer of the hello op.

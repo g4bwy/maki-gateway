@@ -79,6 +79,10 @@ type Event struct {
 	ACP       json.RawMessage `json:"event,omitempty"`
 	Text      string          `json:"text,omitempty"`
 	Code      *int            `json:"code,omitempty"`
+	// TaskID names one task row on a task_focus event. It is `id` on the wire,
+	// where the plugin's own event carries it, and it stays away from every other
+	// event rather than arriving as an empty string.
+	TaskID string `json:"id,omitempty"`
 }
 
 // CreateRequest is one POST /api/sessions body (CONTRACTS 2). Yolo skips every

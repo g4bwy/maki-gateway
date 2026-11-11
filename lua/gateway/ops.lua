@@ -253,12 +253,20 @@ function H.tasks(_req)
   return protocol.array(tasks)
 end
 
---- Shows one chat of the session on screen. `id` is a row of the `tasks` op,
---- and "main" is the main chat. The host takes no session, so it moves the tab
---- the TUI already has focused.
+--- Shows one chat of the session on screen. `task_id` is a row of the `tasks`
+--- op, and "main" is the main chat. The host takes no session, so it moves the
+--- tab the TUI already has focused.
+---
+--- An older gateway sent the same name in `id`, the frame's request number, and
+--- took its answer back under the fallback id 0. A string there still works, so
+--- one plugin build serves both. A number there is only a request number, and a
+--- frame with neither name is refused.
 function H.task_focus(req)
-  local id = req.id
+  local id = req.task_id
   if type(id) ~= "string" or id == "" then
+    id = type(req.id) == "string" and req.id or ""
+  end
+  if id == "" then
     return nil, "id is required"
   end
   local done, err = host(maki.task.focus, id)

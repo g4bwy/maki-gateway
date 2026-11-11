@@ -51,6 +51,11 @@ func (c *conn) handleEvent(m *message) {
 		// A task started, moved, or stopped. maki sends no task rows on the
 		// socket, so the browser refetches GET /api/sessions/{id}/tasks.
 		c.e.publish(model.Event{Type: evTasks, Session: m.Session})
+	case evTaskFocus:
+		// The terminal moved the followed chat, by key or by the FocusTask op.
+		// The rows themselves did not change, so this names the new one rather
+		// than asking for a refetch (CONTRACTS 2).
+		c.e.publish(model.Event{Type: evTaskFocus, Session: m.Session, TaskID: m.taskName()})
 	case "question":
 		c.e.publish(model.Event{Type: evNotice, Text: questionNotice})
 	case evPermission:

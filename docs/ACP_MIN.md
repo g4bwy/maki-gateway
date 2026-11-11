@@ -494,7 +494,7 @@ From `schema/v1/error.rs:202-213` and the maki sites.
 | -32602 | invalid params | unknown mode, bad config option (`server.rs:789,808-819`) | the wire error, 500 |
 | -32603 | internal error | `a prompt is already running` (`server.rs:774`), `session ended` (`:780,826`), a failed turn (`:1092`) | `model.ErrBusy` when the message contains `already running`, else 500 |
 | -32000 | `SESSION_BUSY_CODE` (`server.rs:55`) = the schema's `auth_required` | a session another maki holds, from `load_error` (`server.rs:736-745`) | `model.ErrOpenElsewhere` |
-| -32002 | resource not found | `session/load` of an id with no file (`server.rs:331,742`) | the wire error |
+| -32002 | resource not found | `session/load` of an id with no file (`server.rs:331,742`) | `model.ErrNotFound` |
 
 `SESSION_BUSY_CODE` is the value CONTRACTS 2 needs for the 409 "open elsewhere"
 reply. It collides with `auth_required`, which only a turn answer uses. §3 says
@@ -553,8 +553,10 @@ The result carries no `sessionId`: the load names the session it opened, and the
 engine keeps the id it already had.
 
 - Order of one attempt: close stdin, wait for the death, start
-  `<makiPath> acp [--yolo] [-m <model>]` with the argv the session was created
-  with, then `initialize` and `session/load`. The claim on the session file is an
+  `<makiPath> acp [--yolo] [-m <model>]` with the model the user last chose for
+  this session (the create request, or the newest `SetModel`), then `initialize`
+  and `session/load`. A model the child only reported in its `configOptions` is
+  not that choice, so it never reaches this argv. The claim on the session file is an
   flock tied to the file description of the dying child, so it is only free once
   that process is gone. Closing stdin is what flushes an in-flight turn's
   transcript, which is why nothing harsher is sent for the first 5 s and no kill

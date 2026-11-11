@@ -32,6 +32,8 @@ type fakeTUI struct {
 	frames   []map[string]any  // every request frame received
 	list     []map[string]any  // what the list op answers
 	tasks    []map[string]any  // what the tasks op answers
+	focus    string            // task the last task_focus op moved to the screen
+	noUI     bool              // answer every tab action like a headless maki
 	parked   map[int64]string  // permission request id -> decision wanted
 	answered []int64           // ids the gateway answered
 	frozen   bool              // stop answering ping
@@ -124,6 +126,7 @@ func (f *fakeTUI) restart() {
 	f.answered, f.frozen = nil, false
 	f.parked, f.pending = map[int64]string{}, map[string]string{}
 	f.bare = map[string]bool{}
+	f.noUI, f.focus = false, ""
 	f.mu.Unlock()
 	f.listen()
 }
@@ -267,10 +270,56 @@ func (f *fakeTUI) answer(frame map[string]any) (ok any, fail string, hang bool) 
 		return true, "", false
 	case opTasks:
 		return f.tasksSnapshot(), "", false
+	case opTaskFocus:
+		return f.focusTask(str(frame[argTaskID]))
 	case opRespond:
 		return f.respond(frame)
 	}
 	return nil, "unknown op: " + op, false
+}
+
+// focusTask is the host side of task_focus: the task name arrives in `task_id`,
+// the task must be a row of this tab, and maki answers with the words FocusTask
+// passes through. Following the chat raises the task_focus event the way the host's
+// TaskFocusChanged does. A frame that names no task gets the host's own refusal.
+func (f *fakeTUI) focusTask(taskID string) (any, string, bool) {
+	f.mu.Lock()
+	headless := f.noUI
+	f.mu.Unlock()
+	if taskID == "" {
+		return nil, "id is required", false
+	}
+	if headless {
+		return nil, noUI + " attached", false
+	}
+	found := false
+	for _, row := range f.tasksSnapshot() {
+		if str(row["id"]) == taskID {
+			found = true
+		}
+	}
+	if !found {
+		return nil, "no task with id " + taskID, false
+	}
+	f.mu.Lock()
+	f.focus = taskID
+	f.mu.Unlock()
+	f.push(map[string]any{"event": evTaskFocus, "session": "s1", "id": taskID})
+	return true, "", false
+}
+
+// refuseUI makes this plugin answer every tab action like a maki with no terminal.
+func (f *fakeTUI) refuseUI() {
+	f.mu.Lock()
+	f.noUI = true
+	f.mu.Unlock()
+}
+
+// followedTask is the task the fake last moved onto the screen.
+func (f *fakeTUI) followedTask() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.focus
 }
 
 // respond drains a parked permission, or says expired (CONTRACTS 1).
@@ -436,6 +485,36 @@ func (f *fakeTUI) frameWithOp(op string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// framesOf counts the requests naming one op, so a test can say every call reached
+// the plugin rather than only the last one.
+func (f *fakeTUI) framesOf(op string) []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []map[string]any
+	for _, fr := range f.frames {
+		if str(fr["op"]) == op {
+			out = append(out, fr)
+		}
+	}
+	return out
+}
+
+// framesWithoutNumber are the recorded requests that carry no request number in
+// `id`, which is where CONTRACTS 1 puts one for every op. A frame that used that
+// field for a task name instead would be answered under the plugin's fallback id 0,
+// so a test can name the shape the engine must never send.
+func (f *fakeTUI) framesWithoutNumber() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []map[string]any
+	for _, fr := range f.frames {
+		if n, ok := fr["id"].(float64); !ok || n == 0 {
+			out = append(out, fr)
+		}
+	}
+	return out
 }
 
 func (f *fakeTUI) connCount() int {

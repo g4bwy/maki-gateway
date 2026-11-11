@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -247,6 +248,164 @@ func TestTasksForwardsTheSocketAnswer(t *testing.T) {
 	f.failWith(opTasks, "unknown session: s9")
 	if _, err := e.Tasks("s1"); !errors.Is(err, model.ErrNotFound) {
 		t.Errorf("plugin error mapping: %v", err)
+	}
+}
+
+// routeSession teaches the engine which connection owns one session the way a list
+// pass does, so a test of an op that needs the route does not race that poll.
+func routeSession(t *testing.T, e *Engine, id string) {
+	t.Helper()
+	if _, err := e.List(); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	waitFor(t, "the route of "+id, func() bool {
+		_, ok := e.owner(id)
+		return ok
+	})
+}
+
+// TestFocusTaskCarriesTheTaskID pins the frame of one follow: the task rides in
+// `task_id`, so the frame keeps a request number of its own and the plugin answers
+// it like every other op. A follow is one call to the TUI that owns the session, and
+// it never carries a session argument, because the host moves a chat of the tab the
+// terminal already has focused.
+func TestFocusTaskCarriesTheTaskID(t *testing.T) {
+	f, e, ch := setup(t)
+	routeSession(t, e, "s1")
+	drain(ch)
+	if err := e.FocusTask("s1", "tu1"); err != nil {
+		t.Fatalf("FocusTask: %v", err)
+	}
+	fr := f.frameWithOp(opTaskFocus)
+	if fr == nil {
+		t.Fatalf("task_focus never reached the plugin, saw %v", f.opsSeen())
+	}
+	if fr[argTaskID] != "tu1" {
+		t.Errorf("frame = %v, want the task in task_id", fr)
+	}
+	if n, ok := fr["id"].(float64); !ok || n == 0 {
+		t.Errorf("frame = %v, want a request number in id", fr)
+	}
+	if _, has := fr[argSession]; has {
+		t.Errorf("the host takes no session, so none travels: %v", fr)
+	}
+	if f.followedTask() != "tu1" {
+		t.Errorf("the plugin was left following %q", f.followedTask())
+	}
+	// Following a live tab is one change on the screen, so the browser hears about
+	// it from the plugin's own event rather than from the answer of its call.
+	ev := wantEvent(t, ch, evTaskFocus)
+	if ev.Session != "s1" || ev.TaskID != "tu1" {
+		t.Errorf("follow published %+v, want a task_focus for tu1", ev)
+	}
+	// "main" is the main chat, and the gateway passes it through unchanged.
+	if err := e.FocusTask("s1", "main"); err != nil {
+		t.Errorf("follow the main chat: %v", err)
+	}
+	if ev := wantEvent(t, ch, evTaskFocus); ev.TaskID != "main" {
+		t.Errorf("follow main published %+v", ev)
+	}
+	if extra := drain(ch); len(extra) != 0 {
+		t.Errorf("a follow publishes task_focus only: %+v", extra)
+	}
+	// No frame on this socket may spend its request number on a task name: such a
+	// plugin answer falls back to id 0, where no waiting request can find it.
+	if bad := f.framesWithoutNumber(); len(bad) != 0 {
+		t.Errorf("%d request frames arrived with no number in id: %v", len(bad), bad)
+	}
+}
+
+// TestFocusTaskRefusalsKeepTheWords is the body of POST .../tasks/{tid}/focus. The
+// terminal's own sentence is what a reader can act on, so a reworded refusal or a
+// 500 for a chat that simply is not there both count as broken.
+func TestFocusTaskRefusalsKeepTheWords(t *testing.T) {
+	f, e, _ := setup(t)
+	routeSession(t, e, "s1")
+	err := e.FocusTask("s1", "tu9")
+	if !errors.Is(err, model.ErrNotFound) {
+		t.Errorf("unknown task: err = %v, want ErrNotFound", err)
+	}
+	if err.Error() != "no task with id tu9" {
+		t.Errorf("refusal = %q, want the host's words unchanged", err.Error())
+	}
+
+	f.refuseUI()
+	err = e.FocusTask("s1", "tu1")
+	if !errors.Is(err, model.ErrUnsupported) {
+		t.Errorf("no terminal: err = %v, want ErrUnsupported", err)
+	}
+	if err.Error() != noUI+" attached" {
+		t.Errorf("refusal = %q, want the plugin's words unchanged", err.Error())
+	}
+
+	// A session no connection claims has no screen to move, and the call is never
+	// fanned out: another TUI's tab is not the one the browser is looking at.
+	if err := e.FocusTask("gone", "tu1"); !errors.Is(err, model.ErrNotFound) {
+		t.Errorf("unrouted session: %v", err)
+	}
+	if n := len(f.framesOf(opTaskFocus)); n != 2 {
+		t.Errorf("the plugin was asked to follow %d times, want the two live calls only", n)
+	}
+}
+
+// TestFocusCallsAnswerInOrder drives the same connection from several browsers at
+// once. Each follow now carries its own request number, so the answers cannot be
+// mixed up, and one slow or refused call cannot make another caller wait: every
+// call gets its own reply, in any order.
+func TestFocusCallsAnswerInOrder(t *testing.T) {
+	f, e, _ := setup(t)
+	routeSession(t, e, "s1")
+	f.setTasks(
+		map[string]any{"id": "main", "session": "s1", "name": "main", "focused": true},
+		map[string]any{"id": "t-a", "session": "s1", "name": "a", "status": "done"},
+		map[string]any{"id": "t-b", "session": "s1", "name": "b", "status": "done"},
+	)
+	var wg sync.WaitGroup
+	for _, task := range []string{"t-a", "t-b", "t-a", "t-b", "main"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := e.FocusTask("s1", task); err != nil {
+				t.Errorf("FocusTask(%s): %v", task, err)
+			}
+		}()
+	}
+	wg.Wait()
+	frames := f.framesOf(opTaskFocus)
+	if len(frames) != 5 {
+		t.Fatalf("saw %d task_focus frames, want one per call", len(frames))
+	}
+	numbers := map[float64]string{}
+	for _, fr := range frames {
+		n, _ := fr["id"].(float64)
+		task := str(fr[argTaskID])
+		if n == 0 {
+			t.Errorf("follow of %s carried no request number: %v", task, fr)
+			continue
+		}
+		if twice, dup := numbers[n]; dup {
+			t.Errorf("request number %v was used by the follow of %s and of %s", n, twice, task)
+		}
+		numbers[n] = task
+	}
+	if len(numbers) != 5 {
+		t.Errorf("%d distinct request numbers for 5 follows, want one each", len(numbers))
+	}
+}
+
+// TestTaskFocusEventCarriesTheTask is the other direction: the person at the
+// terminal moved the followed chat with the cycling keys. That event names the task
+// in the `id` field, where CONTRACTS 1 otherwise puts a request number, so a reader
+// that only takes a number there drops the frame and the browser never hears.
+func TestTaskFocusEventCarriesTheTask(t *testing.T) {
+	f, _, ch := setup(t)
+	f.push(map[string]any{"event": evTaskFocus, "session": "s1", "id": "tu1"})
+	ev := wantEvent(t, ch, evTaskFocus)
+	if ev.Session != "s1" || ev.TaskID != "tu1" {
+		t.Errorf("task_focus event = %+v, want session s1 and task tu1", ev)
+	}
+	if extra := drain(ch); len(extra) != 0 {
+		t.Errorf("a follow change publishes task_focus only: %+v", extra)
 	}
 }
 
@@ -604,14 +763,17 @@ func TestHelloRefusalIsWarned(t *testing.T) {
 	f := newFakeTUI(t, dir, "pid-3.sock", 3)
 	f.failWith(opHello, "plugin is not ready")
 	e, _ := startEngine(t, dir, fastTimings())
-	waitFor(t, "a hello reaching the plugin", func() bool {
-		return slices.Contains(f.opsSeen(), opHello)
+	// The plugin records a request before it answers, so waiting on the frame lets
+	// this read the log before the refusal could land in it. The warning is the
+	// fact under test, so the wait goes on that.
+	waitFor(t, "a warning about the refused hello", func() bool {
+		return strings.Contains(logs.String(), "hello refused")
 	})
 	if n := e.connCount(); n != 0 {
 		t.Errorf("a plugin that refuses hello is not tracked: %d conns", n)
 	}
-	if !strings.Contains(logs.String(), "hello refused") {
-		t.Errorf("a refused hello must warn: %q", logs.String())
+	if !slices.Contains(f.opsSeen(), opHello) {
+		t.Error("hello never reached the plugin")
 	}
 }
 

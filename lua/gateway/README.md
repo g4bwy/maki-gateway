@@ -177,9 +177,11 @@ the terminal prompt appear, and sends `permission_cancel` so the dialog can be d
   lower `last`.
 - `pop_queue` acts on the focused tab, because the host has no call for another one. A
   `session` that is not the focused tab returns an error.
-- `task_focus` follows one chat of the tab the terminal already has focused. Its `id` is a row
-  of `tasks`, and `main` is the main chat. The host has no session argument, so another tab is
-  out of reach, and an unknown id comes back as the host error.
+- `task_focus` follows one chat of the tab the terminal already has focused. Its `task_id` is a
+  row of `tasks`, and `main` is the main chat. An older gateway sent that name in `id`, the
+  request number, so a string there still works and a number there names no task. The host has
+  no session argument, so another tab is out of reach, and an unknown id comes back as the host
+  error.
 - `run_command` rejects a `/reload` command line. It would rebuild the plugin host and take
   this plugin, its listener, and every open connection with it.
 - The socket closes when the plugin unloads or maki exits, and the file goes with it. After a

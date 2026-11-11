@@ -54,13 +54,14 @@ type process struct {
 	// armed, so a mutable logger would be a data race.
 	log *slog.Logger
 
-	// args is the argv the session was created with, without --yolo, and yolo is
-	// the permission answer it was created with. Both outlive one process, so a
-	// respawn can repeat the spawn with the flag moved. cwd never changes, so it
-	// needs no lock.
-	args []string
-	yolo bool
-	cwd  string
+	// modelSpec is the model the user last asked this session to run: the -m of
+	// the create request, or the value of the newest SetModel. It outlives one
+	// child, so a respawn can repeat the spawn with the permission answer moved.
+	// The model a child reports for itself is not asked for here, because that is
+	// an answer about the process that is going away.
+	modelSpec string
+	yolo      bool
+	cwd       string
 
 	wmu    sync.Mutex
 	stdin  io.WriteCloser
@@ -93,11 +94,11 @@ func spawn(eng *Engine, cwd, m string, yolo bool) (*process, error) {
 		calls:     map[int64]chan wireMessage{},
 		tr:        newTranscript(),
 		cwd:       cwd,
-		args:      baseArgv(m),
+		modelSpec: m,
 		yolo:      yolo,
 		modelName: m,
 	}
-	c, err := launch(eng.makiPath, cwd, childArgv(p.args, yolo))
+	c, err := launch(eng.makiPath, cwd, childArgv(m, yolo))
 	if err != nil {
 		return nil, err
 	}
@@ -113,27 +114,25 @@ func spawn(eng *Engine, cwd, m string, yolo bool) (*process, error) {
 	return p, nil
 }
 
-// baseArgv is the argv of one web child without the permission answer: the `acp`
-// subcommand, then the model spec when the session named one.
-func baseArgv(m string) []string {
-	args := []string{argACP}
-	if m != "" {
-		args = append(args, argModel, m)
+// childArgv is the argv of one web child: the `acp` subcommand, then its own
+// `--yolo`, which is where maki reads the permission answer (src/cli.rs:428-435,
+// src/cmd/acp.rs:108), then the model the user asked this session for. maki reads
+// both once, at startup, so a running child cannot change its mind and the argv of
+// its successor is the only place either choice is written down.
+//
+// The order matters: `--yolo` is the flag of the `acp` subcommand, and the global
+// flag of the same name (src/cli.rs:145) reaches the tui and print paths only, so
+// `maki --yolo acp` starts a session that still asks.
+func childArgv(modelSpec string, yolo bool) []string {
+	args := make([]string, 0, 4)
+	args = append(args, argACP)
+	if yolo {
+		args = append(args, argYolo)
+	}
+	if modelSpec != "" {
+		args = append(args, argModel, modelSpec)
 	}
 	return args
-}
-
-// childArgv adds or drops the subcommand's own `--yolo`, which is where maki reads
-// the permission answer (src/cli.rs:428-435, src/cmd/acp.rs:108). It reads it once
-// at startup, so a running child cannot change its mind and the flag is the whole
-// of a yolo toggle.
-func childArgv(base []string, yolo bool) []string {
-	args := make([]string, 0, len(base)+1)
-	if !yolo {
-		return append(args, base...)
-	}
-	args = append(args, base[0], argYolo)
-	return append(args, base[1:]...)
 }
 
 // child is one started process with the pipes the gateway drives it on.
@@ -186,9 +185,12 @@ func (p *process) install(c *child) {
 }
 
 // respawnChild starts the next child of this session, asked to answer permissions
-// the way yolo says, and makes it the one the wire methods talk to.
+// the way yolo says and to run the model the user last chose for it.
 func (p *process) respawnChild(yolo bool) error {
-	c, err := launch(p.eng.makiPath, p.cwd, childArgv(p.args, yolo))
+	p.mu.Lock()
+	args := childArgv(p.modelSpec, yolo)
+	p.mu.Unlock()
+	c, err := launch(p.eng.makiPath, p.cwd, args)
 	if err != nil {
 		return err
 	}
@@ -840,7 +842,9 @@ func (m modeState) ids() []string {
 	return ids
 }
 
-// readModel caches the model the agent reports, so List shows what a turn ran.
+// readModel caches the model the agent reports, so List shows what a turn ran. It
+// never touches modelSpec: what a child says it loaded is not what the user asked
+// this session for, and the next child has to be started with the second.
 func (p *process) readModel(options []configOption) {
 	for _, o := range options {
 		if o.ID == optionModel && o.CurrentValue != "" {

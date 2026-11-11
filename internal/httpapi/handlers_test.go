@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -118,6 +119,49 @@ type taskEngine struct {
 
 func (t *taskEngine) Tasks(string) (json.RawMessage, error) { return t.tasksRaw, t.tasksErr }
 
+// focusEngine is the focuser probe: only a live tab has a screen to move, so the
+// follow action is a capability of its own. It records what it was asked for.
+type focusEngine struct {
+	*fakeEngine
+	focusF func(session, taskID string) error
+	calls  []string
+}
+
+func (f *focusEngine) FocusTask(session, taskID string) error {
+	f.calls = append(f.calls, session+"/"+taskID)
+	if f.focusF == nil {
+		return nil
+	}
+	return f.focusF(session, taskID)
+}
+
+// readerEngine is the taskReader probe: a task's transcript comes out of the
+// session file, which only the store engine reads.
+type readerEngine struct {
+	*fakeEngine
+	msgsF func(sessionID, taskID string, last int) ([]json.RawMessage, error)
+	calls []string
+}
+
+func (r *readerEngine) SubMessages(sessionID, taskID string, last int) ([]json.RawMessage, error) {
+	r.calls = append(r.calls, fmt.Sprintf("%s/%s/%d", sessionID, taskID, last))
+	if r.msgsF == nil {
+		return nil, nil
+	}
+	return r.msgsF(sessionID, taskID, last)
+}
+
+// refusal is what an engine that carries another process's words looks like to
+// the HTTP layer: the status comes from the sentinel, the body from Error.
+type refusal struct {
+	sentinel error
+	words    string
+}
+
+func (r refusal) Error() string { return r.words }
+
+func (r refusal) Unwrap() error { return r.sentinel }
+
 // yoloEngine is the yoloSetter probe: only the web engine can start its child with
 // another permission answer, so it is a type of its own rather than another
 // fakeEngine method. It records what it was asked for, in order.
@@ -217,7 +261,9 @@ func TestAllRoutesResolve(t *testing.T) {
 	acp.msgsF = func(string, int) ([]model.Message, error) { return []model.Message{textMessage("m")}, nil }
 	att.msgsF = func(string, int) ([]model.Message, error) { return nil, nil }
 	st.msgsF = func(string, int) ([]model.Message, error) { return nil, model.ErrNotFound }
-	s, _ := newTestServer(t, nil, we, att, st)
+	live := &focusEngine{fakeEngine: att}
+	files := &readerEngine{fakeEngine: st}
+	s, _ := newTestServer(t, nil, we, live, files)
 
 	cases := []struct {
 		method, path, body string
@@ -228,6 +274,8 @@ func TestAllRoutesResolve(t *testing.T) {
 		{"POST", "/api/sessions", `{"cwd":"/x"}`, 201},
 		{"DELETE", "/api/sessions/w1", "", 200},
 		{"GET", "/api/sessions/w1/messages", "", 200},
+		{"GET", "/api/sessions/l1/tasks/tu1/messages", "", 200},
+		{"POST", "/api/sessions/l1/tasks/tu1/focus", "", 200},
 		{"POST", "/api/sessions/w1/prompt", `{"text":"hi"}`, 200},
 		{"POST", "/api/sessions/w1/cancel", "", 200},
 		{"POST", "/api/sessions/w1/mode", `{"mode":"plan"}`, 200},
@@ -591,6 +639,119 @@ func TestTasksRouting(t *testing.T) {
 	bad := &taskEngine{fakeEngine: att, tasksErr: model.ErrNotFound}
 	errSrv, _ := newTestServer(t, nil, acp, bad, st)
 	wantStatus(t, do(errSrv, "GET", "/api/sessions/l1/tasks", ""), http.StatusNotFound)
+}
+
+// TestTaskMessagesRoute: one task's transcript comes out of the session file for
+// every kind of row, an empty transcript is a list, and an id with no log behind
+// it is the 404.
+func TestTaskMessagesRoute(t *testing.T) {
+	acp, att, st := trio()
+	var reader readerEngine
+	reader.fakeEngine = st
+	reader.msgsF = func(sessionID, taskID string, last int) ([]json.RawMessage, error) {
+		switch sessionID + "/" + taskID {
+		case "gone/tu1": // no log behind the id
+			return nil, model.ErrNotFound
+		case "s1/running": // maki writes the burst when the run ends
+			return nil, nil
+		}
+		if last < 2 {
+			return []json.RawMessage{json.RawMessage(`{"role":"assistant","content":[]}`)}, nil
+		}
+		return []json.RawMessage{
+			json.RawMessage(`{"role":"user","content":[{"type":"text","text":"do it"}]}`),
+			json.RawMessage(`{"role":"assistant","content":[{"type":"text","text":"done"}]}`),
+		}, nil
+	}
+	s, _ := newTestServer(t, nil, acp, att, &reader)
+
+	rec := do(s, "GET", "/api/sessions/l1/tasks/tu1/messages", "")
+	wantStatus(t, rec, 200)
+	var body struct {
+		Messages []model.Message `json:"messages"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Messages) != 2 || body.Messages[1].Role != "assistant" {
+		t.Fatalf("transcript = %s", rec.Body.String())
+	}
+	if want := "l1/tu1/" + strconv.Itoa(defaultLast); !slices.Contains(reader.calls, want) {
+		t.Fatalf("the route reads the log named in the path with the default page, saw %v", reader.calls)
+	}
+	// The page size travels, and a running task answers an empty list rather than
+	// null, so the browser has one shape to render.
+	rec = do(s, "GET", "/api/sessions/s1/tasks/tu1/messages?last=1", "")
+	wantStatus(t, rec, 200)
+	if !slices.Contains(reader.calls, "s1/tu1/1") {
+		t.Fatalf("last=1 never reached the reader: %v", reader.calls)
+	}
+	rec = do(s, "GET", "/api/sessions/s1/tasks/running/messages", "")
+	wantStatus(t, rec, 200)
+	wantBody(t, rec, `{"messages":[]}`)
+	rec = do(s, "GET", "/api/sessions/gone/tasks/tu1/messages", "")
+	wantStatus(t, rec, 404)
+	// A task id arrives decoded, as the browser encoded it.
+	do(s, "GET", "/api/sessions/s1/tasks/tu%201/messages", "")
+	if !slices.Contains(reader.calls, "s1/tu 1/"+strconv.Itoa(defaultLast)) {
+		t.Fatalf("encoded task id never reached the reader: %v", reader.calls)
+	}
+	// With no engine that reads files, the route says so.
+	plain, _ := newTestServer(t, nil, acp, att, st)
+	wantStatus(t, do(plain, "GET", "/api/sessions/s1/tasks/tu1/messages", ""), http.StatusNotImplemented)
+}
+
+// TestTaskFocusRoute: following is a live-tab action, and the plugin's refusal
+// words reach the browser as the terminal wrote them.
+func TestTaskFocusRoute(t *testing.T) {
+	acp, att, st := trio()
+	live := &focusEngine{fakeEngine: att}
+	s, _ := newTestServer(t, nil, acp, live, st)
+
+	rec := do(s, "POST", "/api/sessions/l1/tasks/tu1/focus", "")
+	wantStatus(t, rec, 200)
+	wantBody(t, rec, `{"ok":true}`)
+	if !slices.Equal(live.calls, []string{"l1/tu1"}) {
+		t.Fatalf("focus calls = %v", live.calls)
+	}
+	rec = do(s, "POST", "/api/sessions/w1/tasks/tu1/focus", "")
+	wantStatus(t, rec, 501)
+	wantBody(t, rec, `{"error":"`+followLiveText+`"}`)
+	rec = do(s, "POST", "/api/sessions/s1/tasks/tu1/focus", "")
+	wantStatus(t, rec, 501)
+	wantBody(t, rec, `{"error":"`+followLiveText+`"}`)
+	rec = do(s, "POST", "/api/sessions/nope/tasks/tu1/focus", "")
+	wantStatus(t, rec, 404)
+	wantBody(t, rec, `{"error":"unknown session"}`)
+	// A live engine with no follow answer is refused the same way the plan route
+	// refuses an engine with no plan.
+	plain, _ := newTestServer(t, nil, acp, att, st)
+	wantStatus(t, do(plain, "POST", "/api/sessions/l1/tasks/tu1/focus", ""), http.StatusNotImplemented)
+
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantBody string
+	}{
+		{"unknown task", refusal{model.ErrNotFound, "no task with id tu9"}, 404,
+			`{"error":"no task with id tu9"}`},
+		{"no terminal", refusal{model.ErrUnsupported, "no interactive UI attached"}, 501,
+			`{"error":"no interactive UI attached"}`},
+		{"tab gone", refusal{model.ErrNotFound, "not found: session not live: l1"}, 404,
+			`{"error":"not found: session not live: l1"}`},
+		{"engine fault", errors.New("attach: task_focus: write error"), 500,
+			`{"error":"attach: task_focus: write error"}`},
+	}
+	for _, c := range cases {
+		broken := &focusEngine{fakeEngine: att, focusF: func(string, string) error { return c.err }}
+		srv, _ := newTestServer(t, nil, acp, broken, st)
+		rec := do(srv, "POST", "/api/sessions/l1/tasks/tu1/focus", "")
+		if rec.Code != c.wantCode {
+			t.Errorf("%s: status = %d, want %d (%s)", c.name, rec.Code, c.wantCode, rec.Body.String())
+		}
+		wantBody(t, rec, c.wantBody)
+	}
 }
 
 func TestPlanRouting(t *testing.T) {

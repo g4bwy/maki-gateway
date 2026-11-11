@@ -95,6 +95,12 @@ func (c *conn) pluginPID() int {
 // map and answers it, or the caller sees errGone. Never a hung request.
 func (c *conn) request(ctx context.Context, op string, args map[string]any) (json.RawMessage, error) {
 	id := c.e.nextID.Add(1)
+	frame := make(map[string]any, len(args)+2)
+	frame["id"] = id
+	frame["op"] = op
+	for k, v := range args {
+		frame[k] = v
+	}
 	ch := make(chan reply, 1)
 	c.mu.Lock()
 	c.pending[id] = ch
@@ -103,13 +109,6 @@ func (c *conn) request(ctx context.Context, op string, args map[string]any) (jso
 	defer c.forget(id)
 	if dead {
 		return nil, errGone
-	}
-
-	frame := make(map[string]any, len(args)+2)
-	frame["id"] = id
-	frame["op"] = op
-	for k, v := range args {
-		frame[k] = v
 	}
 	if err := c.write(frame); err != nil {
 		return nil, err
@@ -190,27 +189,27 @@ func (c *conn) read() {
 			slog.Debug("attach: unparseable frame", "socket", c.path, "error", err)
 			continue
 		}
-		if m.ID != nil {
+		if m.Event != "" {
+			c.handleEvent(&m)
+			continue
+		}
+		if id, ok := m.requestID(); ok {
 			if !answered(line) {
 				slog.Warn("attach: plugin reply without ok or error, dropping plugin",
-					"socket", c.path, "id", *m.ID)
-				c.reject(*m.ID, errProtocol)
+					"socket", c.path, "id", id)
+				c.reject(id, errProtocol)
 				reason = errProtocol
 				break
 			}
-			c.deliver(&m)
-			continue
-		}
-		if m.Event != "" {
-			c.handleEvent(&m)
+			c.deliver(id, &m)
 		}
 	}
 	c.drop(reason)
 }
 
 // deliver hands an answer to its waiter, if anyone still waits.
-func (c *conn) deliver(m *message) {
-	if ch := c.pop(*m.ID); ch != nil {
+func (c *conn) deliver(id int64, m *message) {
+	if ch := c.pop(id); ch != nil {
 		r := reply{result: m.OK}
 		if m.Error != nil {
 			r.err = pluginError(*m.Error)

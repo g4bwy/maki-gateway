@@ -241,6 +241,10 @@ func (e *Engine) SetMode(id, mode string) error {
 // SetModel switches the model of a live session with session/set_config_option,
 // the config option maki-acp publishes under the id "model" (methods.rs:14). It
 // is not part of model.Engine, because CONTRACTS 2 has no route for it yet.
+//
+// The value is also remembered as the model of the session, which is what the next
+// child of a yolo toggle is started with: maki reads -m at startup only, so a
+// respawn that repeated the create request alone would quietly undo this change.
 func (e *Engine) SetModel(id, m string) error {
 	p, err := e.live(id)
 	if err != nil {
@@ -254,6 +258,7 @@ func (e *Engine) SetModel(id, m string) error {
 	}
 	p.mu.Lock()
 	p.modelName = m
+	p.modelSpec = m
 	p.mu.Unlock()
 	return nil
 }
@@ -272,7 +277,9 @@ func (e *Engine) SetModel(id, m string) error {
 //
 // What it costs the session: every permission dialog the browser still holds is
 // withdrawn, background work of the old child dies with it, and a prompt in flight
-// blocks the toggle with model.ErrBusy rather than being cut short.
+// blocks the toggle with model.ErrBusy rather than being cut short. The model and
+// the working directory are not lost: the next child is started with the model the
+// user last chose for this session, and loads the same session id in the same cwd.
 func (e *Engine) SetYolo(id string, on bool) error {
 	e.mu.Lock()
 	p, ok := e.procs[id]

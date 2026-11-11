@@ -44,6 +44,10 @@ const (
 	// evTasks tells the browser a live tab's task list changed, so it refetches
 	// GET /api/sessions/{id}/tasks (CONTRACTS 2).
 	evTasks = "tasks"
+	// evTaskFocus tells the browser the followed chat of a live tab changed and
+	// names the new one, which is the plugin's own task_focus event relayed
+	// (CONTRACTS 2).
+	evTaskFocus = "task_focus"
 
 	evPermission       = "permission"
 	evPermissionCancel = "permission_cancel"
@@ -72,8 +76,10 @@ const (
 	opRespond   = "respond"
 	opPlan      = "plan"
 	opTasks     = "tasks"
+	opTaskFocus = "task_focus"
 	opPerms     = "permissions"
 	argSession  = "session"
+	argTaskID   = "task_id"
 	argText     = "text"
 	argLast     = "last"
 	argCwd      = "cwd"
@@ -86,6 +92,10 @@ const (
 	argOn       = "on"
 	argYolo     = "yolo"
 )
+
+// noUI is the plugin's fixed answer when its process has no terminal to drive
+// (lua/gateway/ops.lua NO_UI). CONTRACTS 1 keeps the words.
+const noUI = "no interactive UI"
 
 // timings are the engine clocks. New uses the contract values; tests shorten
 // them so a suite does not sleep for minutes.
@@ -629,6 +639,53 @@ func (e *Engine) Plan(id string) (json.RawMessage, error) {
 func (e *Engine) Tasks(id string) (json.RawMessage, error) {
 	return e.raw(id, opTasks, nil)
 }
+
+// FocusTask moves the followed chat of a live tab, which is the terminal side of
+// GET /api/sessions/{id}/tasks/{tid}/focus (CONTRACTS 2). The op names no
+// session, because the host moves a chat of the tab the terminal already has
+// focused, so the id here only says which TUI to ask. The task it moves goes in
+// `task_id`, which leaves the frame's own `id` free for its request number.
+//
+// It asks that TUI alone rather than every live one: following is a change to a
+// screen, and a browser that follows one terminal must not move another's.
+//
+// A refusal keeps the plugin's own words, which are the answer a person should
+// read: "no task with id …" says that id is not a chat of this tab, and
+// "no interactive UI attached" says this maki has no terminal behind it. The
+// first is a 404 and the second a 501 (CONTRACTS 3).
+func (e *Engine) FocusTask(session, taskID string) error {
+	c, ok := e.owner(session)
+	if !ok {
+		return fmt.Errorf("%w: %s: %s", model.ErrNotFound, notLive, session)
+	}
+	ctx, cancel := e.context()
+	defer cancel()
+	var pe pluginError
+	if err := c.call(ctx, opTaskFocus, map[string]any{argTaskID: taskID}, nil); err != nil {
+		if !errors.As(err, &pe) {
+			return MapError(err)
+		}
+		words := string(pe)
+		if matchAny(words, noUI) {
+			return Refusal{Err: model.ErrUnsupported, Words: words}
+		}
+		return Refusal{Err: model.ErrNotFound, Words: words}
+	}
+	return nil
+}
+
+// Refusal is one plugin answer the browser reads as written. Words are the
+// plugin's own, which CONTRACTS 1 fixes, and Err is the sentinel that picks the
+// HTTP status. Wrapping with %w would put that sentinel's text in front of words
+// that are already a complete sentence about the user's own click.
+type Refusal struct {
+	Err   error
+	Words string
+}
+
+func (r Refusal) Error() string { return r.Words }
+
+func (r Refusal) Unwrap() error { return r.Err }
 
 // RespondPermission answers a parked permission prompt. The plugin request id
 // arrives with the permission event, so the ticket map knows who parked it; a
