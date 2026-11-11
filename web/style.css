@@ -125,6 +125,7 @@ body[data-rail="closed"] #rail { display: none; }
 
 #topbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px;
   padding: calc(4px + var(--safe-t)) 6px 4px 6px;
@@ -181,6 +182,24 @@ body[data-rail="closed"] #rail { display: none; }
 .chip.ro { color: var(--amber); border-color: rgba(224, 160, 58, .4); }
 #kind-chip { margin-left: 2px; }
 
+/* Yolo toggle: a pill switch. The dot is the state, amber means prompts are skipped. */
+.chip.yolo { cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.chip.yolo::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+}
+.chip.yolo.on { color: var(--amber); border-color: rgba(224, 160, 58, .55); background: rgba(224, 160, 58, .16); }
+.chip.yolo.on::before { background: currentColor; }
+.chip.yolo:disabled { cursor: default; color: var(--muted); opacity: .7; }
+
+/* Chips are pills, so they stay small and the tap area grows around them instead. */
+.chip.mode, .chip.yolo { position: relative; }
+.chip.mode::after, .chip.yolo::after { content: ''; position: absolute; inset: -11px -4px; }
+
 #offline {
   display: flex;
   align-items: center;
@@ -215,6 +234,24 @@ body[data-rail="closed"] #rail { display: none; }
 .tk { display: flex; gap: 4px; min-width: 0; font: 12px/1.4 var(--mono); overflow-wrap: anywhere; }
 .tk b { color: var(--muted); font-weight: 500; }
 .task .fold { flex: 1 1 100%; }
+
+/* Task rows with an id open the detail sheet, so they are real buttons. */
+button.task { width: 100%; text-align: left; cursor: pointer; }
+button.task:hover { background: var(--raised); }
+
+/* Small pill for markers that ride along a row or a sheet header. */
+.chip-mini {
+  flex: none;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--raised);
+  color: var(--muted);
+  font: 10px/1.5 var(--mono);
+  letter-spacing: .4px;
+  text-transform: uppercase;
+}
+.chip-mini.followed { color: var(--green); border-color: rgba(53, 192, 122, .45); }
 
 /* -------------------------------------------------------------- transcript */
 
@@ -442,6 +479,23 @@ body[data-rail="closed"] #rail { display: none; }
 .layer.full { width: 100%; height: 100%; border-radius: 0; border: 0; }
 .back:has(.layer.full) { padding: 0; align-items: stretch; }
 
+/* Task detail sheet: header strip, banner for empty states, chat-styled rows. */
+.sheet-head { align-items: center; margin-bottom: 10px; }
+.sheet-head .st { flex: none; }
+.sheet-name { font-weight: 600; overflow-wrap: anywhere; }
+.sheet-head .btn { flex: none; padding: 0 12px; font-size: 13px; }
+.sheet-note {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.sheet-note.info { background: rgba(79, 157, 255, .1); border-color: rgba(79, 157, 255, .4); color: var(--link); }
+.sheet-msgs { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* The copy fallback box never shows; it only feeds document.execCommand. */
+.copybox { position: fixed; top: -2em; opacity: 0; }
+
 #toasts {
   position: fixed;
   left: 50%;
@@ -510,6 +564,8 @@ body[data-rail="closed"] #rail { display: none; }
   .layer { border-radius: 14px 14px 0 0; align-self: flex-end; width: 100%; max-height: 92dvh; }
   .back { align-items: flex-end; padding: 0; }
   .layer.drawer { max-height: 100%; border-radius: 14px 0 0 14px; }
+  /* The task sheet takes the whole screen on a phone, close button in its bar. */
+  .layer.task-detail { width: 100%; max-height: 100%; border-radius: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {

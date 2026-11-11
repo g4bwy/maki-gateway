@@ -139,7 +139,7 @@ const waitFor = async (what, cond, ms = 9000) => {
 };
 
 const need = ['rail-toggle', 'rail-close', 'session-list', 'scrim', 'title-btn', 'kind-chip', 'mode-btn',
-  'plan-btn', 'search-btn', 'stats-btn', 'kill-btn', 'offline', 'retry-btn', 'transcript', 'readonly',
+  'yolo-btn', 'plan-btn', 'search-btn', 'stats-btn', 'kill-btn', 'offline', 'retry-btn', 'transcript', 'readonly',
   'input', 'cancel-btn', 'send-btn', 'fab', 'overlays', 'toasts',
   'tasks', 'tasks-head', 'tasks-body', 'tasks-count'];
 check('index.html has every id app.js looks up', need.every((i) => !!el(i)), need.filter((i) => !el(i)).join(','));
@@ -179,7 +179,7 @@ const tr = el('transcript');
 const list = el('session-list');
 
 /* boot: rail, auto-selected web session, rendered blocks */
-check('rail rows', list.children.length === 3, list.children.length);
+check('rail rows', list.children.length === 4, list.children.length);
 check('rail dots carry kind', has(list, 'dot').every((d) => /dot (web|live|stored)/.test(d.className)));
 check('rail status badge', has(list, 'st').some((s) => s.className.includes('working')));
 check('rail cwd tail', has(list, 'rcwd').every((c) => c.textContent.length > 2), txt(has(list, 'rcwd')[0]));
@@ -392,6 +392,148 @@ check('the live rows are on screen after the switch',
 M.selectSession('web-1');
 await tick(400);
 
+/* task detail sheet: rows open a sheet, transcript shares the chat renderers, follow works */
+const FOLLOW_CAVEAT = 'The terminal now sends typed input to this task';
+const RUN_BANNER = 'The transcript is written when the run ends. You can follow it in the terminal meanwhile.';
+const tsec = Math.floor(Date.now() / 1000);
+const detailRows = [
+  { id: 't-7', session: '01J8TQ', name: 'audit the reconcile pass', status: 'working', tool: 'task', cost: 0.0021, started_at: tsec - 90 },
+  { id: 't-8', session: '01J8TQ', name: 'collect contract notes', status: 'done', tool: 'task', cost: 0.011, started_at: tsec - 400, ended_at: tsec - 60 },
+];
+const msgCalls = () => callCount(/\/tasks\/[^/]+\/messages$/);
+const focusCalls = () => callCount(/\/focus$/);
+const taskPathCalls = () => callCount(/\/api\/sessions\/[^/]+\/tasks\/[^/]+\//);
+const rowNamed = (name) => trows().find((r) => txt(r).includes(name));
+const sheetChips = () => has(el('tasks-body'), 'chip-mini');
+/** Toasts expire, so count the caveat at insertion instead of reading the DOM later. */
+let caveatCount = 0;
+const toastsBox = el('toasts');
+const realToastAppend = toastsBox.append;
+toastsBox.append = (...ns) => {
+  for (const n of ns) if (n && n.textContent === FOLLOW_CAVEAT) caveatCount++;
+  return realToastAppend.call(toastsBox, ...ns);
+};
+
+mock.tasksFor('live-1', detailRows);
+M.selectSession('live-1');
+check('task rows with an id are buttons', await waitFor('button rows',
+  () => trows().length === 2 && txt(el('tasks-body')).includes('audit the reconcile pass')
+    && trows().every((r) => r.tagName === 'BUTTON' && r.type === 'button')), trows().map((r) => r.tagName).join());
+check('no followed chip before anything happens', sheetChips().length === 0);
+
+rowNamed('collect contract notes').fire('click');
+check('a finished task sheet renders the transcript blocks', await waitFor('sheet blocks',
+  () => has(top(), 'msg').length === 2 && has(top(), 'thinking').length === 1
+    && has(top(), 'md').length >= 1 && has(top(), 'tool').length === 1), el('overlays').childElementCount + ' layers');
+check('the sheet transcript came from the task messages endpoint', !!lastCall(/\/tasks\/t-8\/messages$/, 'GET'));
+check('opening the sheet fetched the transcript exactly once', msgCalls() === 1, msgCalls());
+const scard = has(top(), 'tool')[0];
+check('the sheet tool card shows the failed result', scard.className.includes('s-failed')
+  && has(scard, 'res').length === 1 && txt(scard).includes('connection refused'), txt(scard).slice(0, 80));
+const shead = () => has(top(), 'sheet-head')[0];
+check('the sheet header carries the task name', txt(top()).includes('collect contract notes'), txt(top()).slice(0, 60));
+check('the sheet header shows the status dot', has(shead(), 'st').length === 1
+  && /(^| )done( |$)/.test(has(shead(), 'st')[0].className), has(shead(), 'st')[0].className);
+check('the sheet header shows cost, started and ended', txt(shead()).includes('$0.011')
+  && txt(shead()).includes('started') && txt(shead()).includes('ended'), txt(shead()));
+check('the sheet offers Follow for a live row', has(top(), 'follow').length === 1 && txt(has(top(), 'follow')[0]) === 'Follow');
+check('the sheet offers a copy-id affordance', has(top(), 'copy-id').length === 1
+  && has(top(), 'copy-id')[0].getAttribute('aria-label') === 'Copy task id');
+
+const m0 = msgCalls();
+mock.emit('tasks', { session: 'live-1' });
+mock.emit('tasks', { session: 'live-1' });
+check('a tasks event refreshes the open sheet transcript', await waitFor('sheet refetch', () => msgCalls() === m0 + 1), msgCalls() - m0);
+await tick(700);
+check('two tasks events refresh the open sheet once, on the same debounce', msgCalls() === m0 + 1, msgCalls() - m0);
+
+has(top(), 'copy-id')[0].fire('click');
+check('copy id toasts without throwing headless', await waitFor('copy toast',
+  () => /task id copied|copy failed/i.test(txt(has(el('toasts'), 'toast').at(-1)))), txt(has(el('toasts'), 'toast').at(-1)));
+
+const fCount = focusCalls();
+has(top(), 'follow')[0].fire('click');
+check('follow posts to the task focus endpoint', await waitFor('focus post', () => focusCalls() > fCount)
+  && !!lastCall(/\/api\/sessions\/live-1\/tasks\/t-8\/focus$/, 'POST'), focusCalls() - fCount);
+check('the followed row gets the chip', await waitFor('row chip',
+  () => has(rowNamed('collect contract notes'), 'chip-mini').length === 1), txt(rowNamed('collect contract notes')).slice(0, 90));
+check('the followed chip reads followed in terminal', txt(sheetChips()[0]) === 'followed in terminal', txt(sheetChips()[0]));
+check('the sheet header shows the followed chip too', has(top(), 'chip-mini')[0].hidden === false);
+check('the caveat toast uses the exact wording', await waitFor('caveat', () => caveatCount === 1), caveatCount);
+const mFollow = msgCalls();
+check('follow schedules one more transcript refresh', await waitFor('follow refetch', () => msgCalls() === mFollow + 1, 3800), msgCalls() - mFollow);
+
+mock.emit('task_focus', { session: 'live-1', id: 't-7' });
+check('the scripted event moves the chip to the named task', await waitFor('chip on t-7',
+  () => has(rowNamed('audit the reconcile pass'), 'chip-mini').length === 1
+    && has(rowNamed('collect contract notes'), 'chip-mini').length === 0), txt(el('tasks-body')).slice(0, 120));
+check('the sheet header chip hides when another task is followed', has(top(), 'chip-mini')[0].hidden === true);
+mock.emit('task_focus', { session: 'live-1', id: 'main' });
+check('task_focus main clears every chip', await waitFor('chips gone', () => sheetChips().length === 0));
+
+has(top(), 'follow')[0].fire('click');
+check('a re-follow marks the chip again', await waitFor('chip back', () => has(top(), 'chip-mini')[0].hidden === false));
+check('the caveat toasts once per session switch', await waitFor('refetch settles', () => caveatCount === 1, 3200)
+  && caveatCount === 1, caveatCount);
+
+mock.emit('task_focus', { session: 'live-1' });
+mock.emit('task_focus', { session: 'live-1', id: 42 });
+mock.emit('task_focus', { session: 'nope-x', id: 't-7', extra: { deep: 1 } });
+await tick(250);
+check('task_focus frames with no usable id or session change nothing', sheetChips().length === 1);
+
+rowNamed('audit the reconcile pass').fire('click');
+check('a running task shows the write-later banner, not an error', await waitFor('banner',
+  () => has(top(), 'sheet-note').some((n) => txt(n) === RUN_BANNER) && has(top(), 'lerr').length === 0
+    && has(top(), 'msg').length === 0), txt(top()).slice(0, 90));
+check('the running banner keeps the info style', has(top(), 'info').length === 1);
+top().querySelector('.icon').fire('click');
+check('the close button dismisses the sheet', el('overlays').childElementCount === 0);
+
+mock.tasksFor('live-1', detailRows.concat([{ id: 'x-9', name: 'dropped chat', status: 'done', ended_at: tsec - 30 }]));
+mock.emit('tasks', { session: 'live-1' });
+check('the panel takes the third row', await waitFor('three rows', () => trows().length === 3));
+rowNamed('dropped chat').fire('click');
+check('a finished task with no transcript records says so', await waitFor('no records',
+  () => txt(top()).includes('No transcript records') && has(top(), 'lerr').length === 0), txt(top()).slice(0, 90));
+mock.tasksFor('live-1', detailRows);
+
+M.selectSession('sto-1');
+check('switching sessions closes the sheet', el('overlays').childElementCount === 0);
+M.selectSession('live-1');
+check('the followed chip survives a round trip', await waitFor('chips back', () => sheetChips().length === 1), sheetChips().length);
+rowNamed('collect contract notes').fire('click');
+check('the sheet opens again on the way back', await waitFor('sheet back', () => has(top(), 'msg').length === 2));
+has(top(), 'follow')[0].fire('click');
+check('after a session switch a new follow toasts the caveat again',
+  await waitFor('caveat 2', () => caveatCount === 2, 5000), caveatCount);
+toastsBox.append = realToastAppend;
+
+M.selectSession('web-1');
+check('the web row hides every task control', el('overlays').childElementCount === 0 && el('tasks').hidden === true);
+const webTaskPathFrom = taskPathCalls();
+await tick(500);
+check('no task detail request runs while a web session is open', taskPathCalls() === webTaskPathFrom, taskPathCalls() - webTaskPathFrom);
+const tmWeb = await store.api.taskMessages('web-1', 't-8').catch(() => null);
+check('task messages for a web session answer empty, not 404', !!tmWeb && Array.isArray(tmWeb.messages) && tmWeb.messages.length === 0);
+const tm404 = await store.api.taskMessages('nope-9', 't-8').then(() => null, (e) => e);
+check('task messages 404 only for an unknown session', !!tm404 && tm404.status === 404, tm404 && tm404.status);
+const tfWeb = await store.api.taskFocus('web-1', 't-8').then(() => null, (e) => e);
+check('focus on a web session answers 501', !!tfWeb && tfWeb.status === 501, tfWeb && tfWeb.status);
+const tfNoTask = await store.api.taskFocus('live-1', 'nope-9').then(() => null, (e) => e);
+check('focus on an unknown task 404s with the plugin wording', !!tfNoTask && tfNoTask.status === 404
+  && tfNoTask.message === 'no task with id nope-9', tfNoTask && tfNoTask.message);
+mock.oldPlugin('live-1');
+const tfOld = await store.api.taskFocus('live-1', 't-8').then(() => null, (e) => e);
+check('a TUI without the updated plugin 404s verbatim', !!tfOld && tfOld.status === 404
+  && tfOld.message === 'no interactive UI attached', tfOld && tfOld.message);
+mock.oldPlugin('live-1', false);
+const tfMain = await store.api.taskFocus('live-1', 'main');
+check('following the main chat succeeds', !!tfMain && tfMain.ok === true);
+await tick(400);
+const rowsSeen = await store.api.tasks('live-1');
+check('the two detail rows remain what live-1 reports', rowsSeen.tasks.length === 2 && rowsSeen.tasks[0].id === 't-7', txt(el('tasks-body')));
+
 /* mode chip */
 M.selectSession('web-1');
 await tick(500);
@@ -570,6 +712,69 @@ await M.selectSession(yid);
 await tick(500);
 check('the yolo session says it answered itself', txt(tr).includes('answered itself'), txt(tr).slice(-90));
 
+/* yolo chip in the top bar: a web row toggles, a live row explains, stored has none */
+const YOLO_TIP_LIVE = 'toggle /yolo in the terminal — the web cannot change a running TUI session';
+const chip = () => el('yolo-btn');
+const checked = () => chip().getAttribute('aria-checked');
+const yoloCalls = () => callCount(/\/yolo$/);
+const rowYolo = (id) => (M.S.sessions.find((x) => x.id === id) || {}).yolo;
+check('the YOLO chip follows the mode chip in the markup',
+  /id="mode-btn"[\s\S]{0,200}?id="yolo-btn"[^>]*>YOLO</.test(html));
+M.selectSession('web-1');
+await tick(500);
+check('web row shows the yolo chip as a switch that is off', chip().hidden === false && chip().disabled === false
+  && checked() === 'false' && !chip().className.includes('on'), chip().hidden + ' ' + checked());
+check('yolo chip carries a name, a state, and a tooltip', chip().getAttribute('aria-label') === 'YOLO mode'
+  && chip().getAttribute('aria-disabled') === 'false' && chip().getAttribute('title').includes('YOLO'),
+  chip().getAttribute('aria-label') + ' | ' + chip().getAttribute('title'));
+const busyFrom = yoloCalls();
+chip().fire('click');
+check('tapping the chip posts', await waitFor('yolo post', () => yoloCalls() > busyFrom), yoloCalls() - busyFrom);
+check('an off web row posts {on:true}',
+  (lastCall(/\/api\/sessions\/web-1\/yolo$/, 'POST') || { body: {} }).body.on === true,
+  JSON.stringify((lastCall(/\/yolo$/, 'POST') || {}).body));
+check('busy keeps the chip off and names what to do', await waitFor('busy chip', () => checked() === 'false'
+  && has(el('toasts'), 'toast').some((t) => /finish or cancel the current turn first/.test(txt(t)))),
+  txt(has(el('toasts'), 'toast').at(-1)));
+check('a rejected toggle leaves the row untouched', !rowYolo('web-1'), String(rowYolo('web-1')));
+M.selectSession('live-1');
+await tick(500);
+check('live row shows the chip disabled', chip().hidden === false && chip().disabled === true
+  && chip().getAttribute('aria-disabled') === 'true' && checked() === 'false', String(chip().disabled));
+check('the live chip points at the terminal', chip().getAttribute('title') === YOLO_TIP_LIVE
+  && chip().getAttribute('aria-label') === YOLO_TIP_LIVE, chip().getAttribute('title'));
+const liveFrom = yoloCalls();
+chip().fire('click');
+await tick(600);
+check('a disabled chip sends no request', yoloCalls() === liveFrom, yoloCalls() - liveFrom);
+M.selectSession('sto-1');
+await tick(500);
+check('stored row has no yolo chip at all', chip().hidden === true, String(chip().hidden));
+M.selectSession('web-yolo-1');
+await tick(500);
+check('the seeded yolo row reads on from the payload', chip().hidden === false && chip().disabled === false
+  && checked() === 'true' && chip().className.includes('on'), checked());
+chip().fire('click');
+const offPost = await waitFor('yolo off post', () => lastCall(/\/api\/sessions\/web-yolo-1\/yolo$/, 'POST'), 3000);
+check('tapping an on chip posts {on:false}', !!offPost && offPost.body.on === false,
+  JSON.stringify(offPost && offPost.body));
+check('the chip takes the state the reply reports', await waitFor('chip off', () => checked() === 'false'
+  && !chip().className.includes('on') && !rowYolo('web-yolo-1')), checked() + ' ' + rowYolo('web-yolo-1'));
+await store.api.setYolo('web-yolo-1', true);
+check('a sessions refetch moves the chip with no click',
+  await waitFor('chip on from the payload', () => checked() === 'true' && chip().className.includes('on')),
+  checked());
+M.selectSession(yid);
+await tick(500);
+check('a chat created with yolo ticks the chip from its own row',
+  chip().hidden === false && chip().disabled === false && checked() === 'true', M.S.current + ' ' + rowYolo(yid));
+const fetchReal = globalThis.fetch;
+globalThis.fetch = async () => { throw new TypeError('gateway down'); };
+chip().fire('click');
+check('a network failure toasts and changes nothing', await waitFor('net toast', () => checked() === 'true'
+  && has(el('toasts'), 'toast').some((t) => /gateway down/.test(txt(t)))), txt(has(el('toasts'), 'toast').at(-1)));
+globalThis.fetch = fetchReal;
+
 /* cancel then kill a web session */
 el('cancel-btn').fire('click');
 await tick(600);
@@ -597,8 +802,8 @@ check('status event patches the rail in place', txt(list).includes('Renamed by e
 const rowsBefore = [...list.children];
 mock.emit('sessions', {});
 await tick(800);
-// web-1 + live-1 + sto-1 + the two sessions this run created (one plain, one yolo)
-check('sessions event keeps row count', list.children.length === 5, list.children.length);
+// web-1 + live-1 + sto-1 + web-yolo-1 + the two sessions this run created (one plain, one yolo)
+check('sessions event keeps row count', list.children.length === 6, list.children.length);
 check('sessions event reuses rows', rowsBefore.every((n, i) => list.children[i] === n));
 check('no leaked layers', el('overlays').childElementCount === 0, txt(el('overlays')).slice(0, 60));
 const rowsNow = M.S.messages.length;

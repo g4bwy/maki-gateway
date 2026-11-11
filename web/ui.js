@@ -4,10 +4,17 @@
  * Nothing here knows about SSE or state sync; app.js calls these.
  */
 import { S, api, ApiError, json, ago, money, num, lastCwd, saveCwd, yoloFor, saveYolo, session } from './store.js';
-import { el, markdownEl, codeText } from './render.js';
+import { el, markdownEl, codeText, renderMessages } from './render.js';
 
 const TOAST_MS = 4200;
 const SEARCH_MS = 300;
+/** Exact wording the follow feature must show once per session switch. */
+const FOLLOW_CAVEAT = 'The terminal now sends typed input to this task';
+const FOLLOWED_LABEL = 'followed in terminal';
+const RUN_BANNER = 'The transcript is written when the run ends. You can follow it in the terminal meanwhile.';
+const NO_TRANSCRIPT = 'No transcript records.';
+/** maki writes a sub transcript at run end; one more pull shortly after a follow catches it. */
+const FOLLOW_REFETCH_MS = 2000;
 const YOLO_LABEL = 'yolo — skip permission prompts, deny rules still apply';
 /** Task fields worth a glance. Anything else a row carries stays in the JSON fold. */
 const TASK_KEYS = ['name', 'label', 'title', 'tool', 'model', 'plugin', 'cost', 'session', 'id'];
@@ -400,9 +407,15 @@ function fieldValue(k, v) {
  * then anything structured behind a JSON fold. Nothing is assumed required, so a
  * row with only an id renders, and so does a row that is not an object at all.
  */
-export function taskRow(t) {
-  const row = el('div', 'task');
+function taskRow(t, sid, onOpen) {
   const obj = t && typeof t === 'object' && !Array.isArray(t) ? t : null;
+  const tid = obj && typeof obj.id === 'string' ? obj.id : '';
+  const open = !!onOpen && !!tid;
+  const row = el(open ? 'button' : 'div', 'task');
+  if (open) {
+    row.type = 'button';
+    row.addEventListener('click', () => onOpen(t));
+  }
   const status = obj && obj.status != null ? String(obj.status) : '';
   const dot = el('span', 'st ' + (TASK_STATES.includes(status) ? status : 'idle'));
   dot.setAttribute('title', status || 'unknown');
@@ -420,13 +433,156 @@ export function taskRow(t) {
     row.append(fieldPair(k, v === true ? 'yes' : fieldValue(k, v)));
   }
   if (Object.keys(extra).length) row.append(extraFold(extra));
+  if (open && followed.get(sid) === tid) row.append(el('span', 'chip-mini followed', FOLLOWED_LABEL));
   return row;
 }
 
 /** Rows for the sub-agents panel. Empty or malformed payloads read as "none running". */
-export function taskRows(tasks) {
+export function taskRows(tasks, sid, onOpen) {
   if (!Array.isArray(tasks) || !tasks.length) return [el('p', 'dim', 'none running')];
-  return tasks.map(taskRow);
+  return tasks.map((t) => taskRow(t, sid, onOpen));
+}
+
+/* ------------------------------------------------------------ task detail */
+
+/** sid -> followed task id. "main" and unknown ids clear the marker. */
+const followed = new Map();
+let caveatSid = '';
+let sheet = null;
+
+/** Move the followed marker; repaints the open sheet header when it belongs to it. */
+export function markFollowed(sid, tid) {
+  if (!sid) return;
+  if (!tid || tid === 'main') followed.delete(sid);
+  else followed.set(sid, tid);
+  if (sheet && sheet.sid === sid) sheet.paintHead();
+}
+
+/** The session changed: the sheet showed a task of the old tab, the caveat re-arms. */
+export function leaveSession() {
+  caveatSid = '';
+  if (sheet) sheet.l.close();
+}
+
+/** The open sheet's target, so app.js refreshes the transcript only for that row. */
+export const taskSheetOpen = () => (sheet ? { sid: sheet.sid, tid: sheet.tid } : null);
+
+/** Tasks were refetched while the sheet is open: take the fresh row, reload the transcript. */
+export function taskSheetUpdate(sid, task) {
+  if (!sheet || sheet.sid !== sid) return;
+  if (task) sheet.task = task;
+  sheet.load();
+}
+
+/** Clipboard API first, a selected textarea as fallback. Never throws headless. */
+async function copyId(tid) {
+  let done = false;
+  const clip = globalThis.navigator && globalThis.navigator.clipboard;
+  if (clip && clip.writeText) {
+    try { await clip.writeText(String(tid)); done = true; } catch { done = false; }
+  }
+  if (!done) {
+    const ta = el('textarea', 'copybox');
+    ta.value = String(tid);
+    ta.setAttribute('readonly', 'readonly');
+    document.body.append(ta);
+    ta.select();
+    try { if (document.execCommand) done = document.execCommand('copy') === true; } catch { done = false; }
+    ta.remove();
+  }
+  toast(done ? 'Task id copied.' : 'Copy failed: no clipboard here.', done ? 'ok' : 'err');
+}
+
+/**
+ * Detail sheet for one task: header (name, status dot, cost/times, follow, copy)
+ * over the task transcript rendered with the same block renderers as the chat.
+ */
+export function openTaskSheet(sid, tid, task, repaintRows) {
+  if (sheet) sheet.l.close();
+  const t0 = task && typeof task === 'object' ? task : {};
+  const name = t0.name || t0.label || t0.title || tid;
+  const head = el('div', 'meta sheet-head');
+  const dot = el('span', 'st');
+  const when = el('span', 'dim');
+  const badge = el('span', 'chip-mini followed', FOLLOWED_LABEL);
+  const follow = el('button', 'btn follow', 'Follow');
+  follow.type = 'button';
+  const copy = el('button', 'icon copy-id');
+  copy.type = 'button';
+  copy.setAttribute('aria-label', 'Copy task id');
+  copy.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>';
+  head.append(dot, el('b', 'sheet-name', name), when, badge, el('span', 'spacer'), follow, copy);
+  const note = el('p', 'dim', 'Loading…');
+  const msgs = el('div', 'sheet-msgs');
+
+  const me = {
+    sid, tid, task: t0, l: null, req: 0,
+    paintHead() {
+      const status = me.task.status != null ? String(me.task.status) : '';
+      dot.className = 'st ' + (TASK_STATES.includes(status) ? status : 'idle');
+      dot.setAttribute('title', status || 'unknown');
+      const bits = [];
+      if (typeof me.task.cost === 'number') bits.push(money(me.task.cost));
+      if (me.task.started_at) bits.push('started ' + (ago(me.task.started_at) || me.task.started_at));
+      if (me.task.ended_at) bits.push('ended ' + (ago(me.task.ended_at) || me.task.ended_at));
+      when.textContent = bits.join(' · ');
+      badge.hidden = followed.get(sid) !== tid;
+      follow.hidden = (session(sid) || {}).kind !== 'live';
+    },
+    async load() {
+      const mine = ++me.req;
+      try {
+        const r = await api.taskMessages(sid, tid);
+        if (sheet !== me || mine !== me.req) return;
+        me.paint(r);
+      } catch (e) {
+        if (sheet !== me || mine !== me.req) return;
+        msgs.replaceChildren();
+        note.className = 'lerr';
+        note.hidden = false;
+        note.textContent = 'Could not load this transcript: ' + e.message;
+      }
+    },
+    paint(r) {
+      const list = Array.isArray(r && r.messages) ? r.messages : [];
+      if (list.length) {
+        note.hidden = true;
+        renderMessages(msgs, list.map((m) => ({ ...m })));
+        return;
+      }
+      msgs.replaceChildren();
+      const running = String(me.task.status || '') === 'working' || !me.task.ended_at;
+      note.className = 'sheet-note ' + (running ? 'info' : 'dim');
+      note.hidden = false;
+      note.textContent = running ? RUN_BANNER : NO_TRANSCRIPT;
+    },
+  };
+  sheet = me;
+  me.paintHead();
+  const l = layer('drawer task-detail', name, [head, note, msgs], () => {
+    if (sheet === me) sheet = null;
+  });
+  me.l = l;
+  follow.addEventListener('click', async () => {
+    follow.disabled = true;
+    try {
+      await api.taskFocus(sid, tid);
+      markFollowed(sid, tid);
+      if (caveatSid !== sid) {
+        caveatSid = sid;
+        toast(FOLLOW_CAVEAT);
+      }
+      if (repaintRows) repaintRows();
+      setTimeout(() => { if (sheet === me) me.load(); }, FOLLOW_REFETCH_MS);
+    } catch (e) {
+      fail(e, 'Could not follow that task.');
+    } finally {
+      follow.disabled = false;
+    }
+  });
+  copy.addEventListener('click', () => copyId(tid));
+  me.load();
+  return l;
 }
 
 /** Drop the modal that a permission_cancel refers to. */

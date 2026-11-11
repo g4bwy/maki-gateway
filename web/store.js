@@ -88,10 +88,13 @@ export const api = {
   prompt: (id, text) => req('POST', `/api/sessions/${encodeURIComponent(id)}/prompt`, { text }),
   cancel: (id) => req('POST', `/api/sessions/${encodeURIComponent(id)}/cancel`),
   setMode: (id, mode) => req('POST', `/api/sessions/${encodeURIComponent(id)}/mode`, { mode }),
+  setYolo: (id, on) => req('POST', `/api/sessions/${encodeURIComponent(id)}/yolo`, { on }),
   setTitle: (id, title) => req('POST', `/api/sessions/${encodeURIComponent(id)}/title`, { title }),
   kill: (id) => req('DELETE', `/api/sessions/${encodeURIComponent(id)}`),
   plan: (id) => req('GET', '/api/plan/' + encodeURIComponent(id)),
   tasks: (id) => req('GET', `/api/sessions/${encodeURIComponent(id)}/tasks`),
+  taskMessages: (id, tid) => req('GET', `/api/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/messages`),
+  taskFocus: (id, tid) => req('POST', `/api/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(tid)}/focus`),
   search: (q) => req('GET', '/api/search?q=' + encodeURIComponent(q)),
   analytics: (days = 30) => req('GET', '/api/analytics?days=' + days),
   create(cwd, model, prompt, yolo) {

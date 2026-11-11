@@ -10,7 +10,7 @@ Automated, no browser needed. It drives the real modules through a DOM shim and
 prints one line per check:
 
 ```
-cd maki-gateway/web && node test-mock.mjs     # 185 checks, then ALL CHECKS PASSED
+cd maki-gateway/web && node test-mock.mjs     # 246 checks, then ALL CHECKS PASSED
 ```
 
 By hand, in a browser:
@@ -27,17 +27,27 @@ few paths on demand:
 maki.mock.permission('live-1')               // open a permission dialog now
 maki.mock.emit('notice', { text: 'hello' })  // any SSE envelope
 maki.mock.emit('tasks', { session: 'live-1' })  // a task changed: the panel refetches
+maki.mock.emit('task_focus', { session: 'live-1', id: 't-7' })  // the terminal follows that task
 maki.mock.tasks('live-1', [])                // the rows live-1 reports from now on
+maki.mock.taskTranscript('live-1', 't-8', [])  // the stored transcript of one task
+maki.mock.oldPlugin('live-1')                // focus answers like a TUI with an old plugin
 maki.mock.expire('acp', 101)                 // next answer to id 101 replies 404
 maki.mock.drop(6)                            // cut the fake stream for 6 s
 maki.mock.quiet()                            // stop the background status traffic
 ```
 
 Mock sessions: `web-1` (kind web, streaming), `live-1` (kind live, dirty refetch),
-`sto-1` (kind stored, read only). Creating a chat adds a new `web-*` session. `live-1`
-reports two fake sub-agent tasks (one working, one done); every other kind answers 501
-for the task list, like the gateway does. A chat created with the yolo box ticked
-answers its own permission prompts, so no dialog opens for it.
+`sto-1` (kind stored, read only), and `web-yolo-1` (kind web, idle, spawned with --yolo).
+Creating a chat adds a new `web-*` session. `live-1` reports two fake sub-agent tasks (one
+working, one done); every other kind answers 501 for the task list, like the gateway does.
+The working task has no stored transcript, so its messages endpoint answers an empty list. The
+done task has a short fake transcript (thinking, text, one failed tool result). Its focus
+endpoint answers like the frozen task contract: 200 for a live row, 501 for web and stored,
+404 with the plugin error text otherwise, and a `task_focus` event after a successful follow.
+A chat created with the yolo box ticked answers its own permission prompts, so no dialog
+opens for it. `POST /api/sessions/{id}/yolo` flips the flag on a web row and raises a
+`sessions` event. It replies 409 while that row is mid-prompt, so the working `web-1`
+always rejects a toggle, and it replies 501 for the live and stored rows.
 
 ## Layout and style
 
@@ -76,7 +86,7 @@ answers its own permission prompts, so no dialog opens for it.
 15. `live-1` shows a failed card in red with an "error" label, an image placeholder,
     and an unknown block rendered as raw JSON.
 16. `sto-1` is read-only: the composer is disabled, "read-only transcript" shows, and
-    the send, cancel, mode, plan, and kill controls are all hidden.
+    the send, cancel, mode, plan, kill, and yolo controls are all hidden.
 17. Read the escaped sample: it prints `<script>alert(1)</script>` as text and there is
     no popup. Check the page source for a `<script>alert` inside the transcript.
 18. Scroll up, then let a turn stream. The view stays where you left it. Near the
@@ -131,12 +141,73 @@ answers its own permission prompts, so no dialog opens for it.
 38. Deny with text in the guidance box: the plan drawer picks that text up, as before.
 39. Open `live-1`: a "Sub-agents" section sits under the top bar with a count of 2, one
     row spinning and one done. Each row shows the fields its task carries (name, tool,
-    cost, elapsed time) and folds the rest as JSON. `web-1` and `sto-1` have no section.
+    cost, elapsed time) and folds the rest as JSON. Tapping a row opens the task sheet
+    (section below). `web-1` and `sto-1` have no section.
 40. With `live-1` open, run `maki.mock.tasks('live-1', [])` then
     `maki.mock.emit('tasks', { session: 'live-1' })`: after half a second the panel
     refetches and reads "none running". Three `tasks` events in a row refetch once.
 41. Reload on a phone width: the section starts collapsed, and its own header folds it.
     That does not touch the session rail, which folds separately.
+
+## Yolo chip in the top bar
+
+42. Open `web-1`: a `YOLO` pill sits next to the mode chip with a hollow dot, and the
+    kind chip still reads WEB. Open `web-yolo-1`: the same pill shows an amber background
+    with a filled dot. The pill is a switch (`role="switch"`), so a screen reader says
+    "on" or "off". `sto-1` shows no pill.
+43. Open `live-1`: the pill is dimmed and disabled. Its tooltip and its accessible name
+    both read "toggle /yolo in the terminal — the web cannot change a running TUI
+    session". Tapping it sends nothing. Watch the Network tab: no request appears.
+44. Tap the pill on `web-yolo-1`: the request body is `{"on":false}` and the reply
+    `{"yolo":false}` is what turns the pill off. Reload: the mock starts it on again,
+    because the row, not the browser, owns the flag.
+45. Tap the pill on `web-1` while it works: the reply is 409, the toast reads "finish or
+    cancel the current turn first", and the pill stays off. The mock cannot fail a POST,
+    so the automated run stubs `fetch` to cover the request-error toast.
+46. Open `web-yolo-1` and run `maki.api.setYolo('web-yolo-1', true)` in the console. The
+    mock answers, raises a `sessions` event, and the pill turns on with no tap. The same
+    refetch brings the flag for a row you just created, so the pill and the new chat box
+    always describe one value.
+47. Look at the top bar at 390 px: the pills and icons move to a second row and nothing
+    scrolls sideways. The pills stay small, so their tap area is grown to about 44 px
+    around each one instead.
+
+## Task detail sheet and follow
+
+48. Open `live-1`. The sub-agent rows are buttons, each still 44 px tall. Tap
+    `collect contract notes` (done). A sheet opens on the right. On a phone width it covers the
+    whole screen, and the Close icon in its bar dismisses it. The header shows the task name, a
+    green status dot, the cost, and the started and ended times. Tap the copy icon: the task id
+    goes to the clipboard and a toast confirms it. Without clipboard permission a hidden text
+    box feeds the copy, and no error appears.
+49. Read the sheet body: it shows the task transcript with the same blocks as the main chat.
+    Expect a folded thinking section, a markdown paragraph, and one tool card marked failed
+    with its error text inside.
+50. Tap `audit the reconcile pass` (working). Its transcript is not written yet, so the sheet
+    shows an info banner instead of an error, with this text: "The transcript is written when
+    the run ends. You can follow it in the terminal meanwhile." A finished task without a
+    transcript answers "No transcript records." You can drive that with
+    `maki.mock.taskTranscript('live-1', 't-8', [])` and a reload of the sheet.
+51. Tap FOLLOW in a live sheet header. The request goes to
+    `POST /api/sessions/live-1/tasks/{id}/focus`. On success the row and the sheet header get a
+    small `followed in terminal` chip, and the toast reads exactly: "The terminal now sends
+    typed input to this task". That wording is the steering caveat: from that point the person
+    at the terminal types into that task. The toast appears once per session: follow a second
+    task in the same session and no new toast comes. Switch to another session and back, and
+    the next follow toasts again. The sheet fetches the transcript once more about 2 s after a
+    successful follow.
+52. With a sheet open, run `maki.mock.emit('tasks', { session: 'live-1' })`. The transcript
+    refetches once on the same 500 ms debounce as the panel. Three events in a row refetch
+    once.
+53. The mock answers a successful follow with a `task_focus` event after a short delay, like
+    the terminal would. Run `maki.mock.emit('task_focus', { session: 'live-1', id: 't-7' })`:
+    the chip moves to that row, and a sheet for another task hides its chip. `id: 'main'`
+    clears every chip. A `task_focus` event with no id, or for another session, changes nothing
+    on screen.
+54. A `web` or `stored` session has no rows, so a FOLLOW button never shows there. Run
+    `maki.api.taskFocus('web-1', 't-8')`: 501. Run `maki.api.taskFocus('live-1', 'nope')`:
+    404 with "no task with id nope". Run `maki.mock.oldPlugin('live-1')` and follow again:
+    404 with "no interactive UI attached", the verbatim plugin error.
 
 ## Notes for the real gateway
 
@@ -146,11 +217,20 @@ answers its own permission prompts, so no dialog opens for it.
   for a live tab. Row 1 of that list is the main chat: it carries no `status`. The panel
   paints a plain ring for any row whose status it does not know, and keeps the fields it
   cannot show behind the JSON fold.
+- The task sheet uses the frozen task-detail contract. `GET .../tasks/{id}/messages` answers
+  200 with an empty list while a task runs, because maki writes sub transcripts only at run
+  end. It answers 404 only for an unknown session. `POST .../tasks/{id}/focus` answers
+  `{"ok":true}` for a live row, 501 for web and stored, and 404 with the plugin error text
+  verbatim. The browser expects a `task_focus` SSE event with fields `session` and `id`
+  whenever the followed task in the terminal changes, `id` `"main"` included.
 - Unknown message, block, or ACP shapes render as raw JSON rather than dropping text.
 - The renderer trusts only `http:`, `https:`, and `mailto:` links.
 - No endpoint reports the current mode, so the build/plan chip label is optimistic. It
   rolls back when the POST fails, and it follows the server when an ACP
   `current_mode_update` arrives. A `mode` field on `Session` would settle it.
+- The yolo pill has no state of its own. It reads `yolo` off the row, and the row only
+  changes from `GET /api/sessions` or from the `{"yolo":...}` body of its own POST. An
+  absent flag reads as off, so a gateway that does not send it shows an off pill.
 - `dirty` for a session that is not open is ignored: opening it fetches anyway. The same
   holds for `tasks`. The `tasks` op reports the tab the TUI has focused, which is not
   always the tab the event names, so a row set can describe another tab.

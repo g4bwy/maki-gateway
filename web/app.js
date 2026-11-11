@@ -11,7 +11,8 @@
  * (acp.js); sessions of kind `live` only report `dirty`, so a debounced 500 ms
  * refetch pulls the whole tail. `sessions`, `status`, `notice`, `exit` and
  * `permission` events drive the rail, the toasts, and the decision modals. A
- * `tasks` event refetches the sub-agents panel the same debounced way.
+ * `tasks` event refetches the sub-agents panel the same debounced way, and a
+ * `task_focus` event moves the followed-task marker the detail sheet sets.
  *
  * Development without a gateway: `/?mock=1` loads mock.js. Real paths stay real.
  */
@@ -21,12 +22,16 @@ import { applyUpdate, closeStream } from './acp.js';
 import {
   toast, askText, askYes, popLayer, newChat, searchOverlay, analyticsView,
   planDrawer, permissionModal, permissionGone, taskRows,
+  openTaskSheet, taskSheetOpen, taskSheetUpdate, markFollowed, leaveSession,
 } from './ui.js';
 
 const MAX_GROW = 180;
 const DIRTY_MS = 500;
 const TICK_MS = 30000;
 const KIND_LABEL = { web: 'WEB', live: 'LIVE', stored: 'STORED' };
+const YOLO_TIP = 'YOLO answers permission prompts for this session. Tap to change it.';
+const YOLO_TIP_LIVE = 'toggle /yolo in the terminal — the web cannot change a running TUI session';
+const YOLO_BUSY = 'finish or cancel the current turn first';
 
 const $ = (id) => document.getElementById(id);
 const row = (id) => els.list.querySelector(`[data-id="${CSS.escape(id)}"]`);
@@ -37,6 +42,7 @@ let events = null;
 let queued = false;
 let tasksOpen = true;
 let tasksReq = 0;
+let lastTasks = [];
 
 /** Short text a thumb can read in a toast. */
 const errText = (e, fallback) => (e instanceof ApiError
@@ -101,6 +107,7 @@ export async function selectSession(id) {
     loadTasks();
     return loadMessages();
   }
+  leaveSession();
   S.messages = [];
   S.pending = [];
   els.transcript.replaceChildren();
@@ -203,10 +210,26 @@ function paintTopbar() {
   els.mode.hidden = !(live || web);
   els.mode.textContent = S.mode;
   els.mode.className = 'chip mode m-' + S.mode;
+  paintYolo(s, web, live);
   els.plan.hidden = !live;
   els.kill.hidden = !web;
   paintTasksPanel();
   paintComposer();
+}
+
+/**
+ * The yolo chip reads its state off the row, never off a guess: the sessions
+ * payload owns `yolo`, so a refetch is what moves it (CONTRACTS 2).
+ */
+function paintYolo(s, web, live) {
+  const on = web && s.yolo === true;
+  els.yolo.hidden = !(web || live);
+  els.yolo.disabled = !web;
+  els.yolo.classList.toggle('on', on);
+  els.yolo.setAttribute('aria-checked', String(on));
+  els.yolo.setAttribute('aria-disabled', String(!web));
+  els.yolo.setAttribute('title', web ? YOLO_TIP : YOLO_TIP_LIVE);
+  els.yolo.setAttribute('aria-label', web ? 'YOLO mode' : YOLO_TIP_LIVE);
 }
 
 /* -------------------------------------------------------------- sub-agents */
@@ -219,6 +242,7 @@ function paintTasksPanel() {
   els.tasksCount.textContent = '';
   els.tasksBody.dataset.for = '';
   els.tasksBody.replaceChildren();
+  lastTasks = [];
 }
 
 function setTasksOpen(open) {
@@ -227,10 +251,20 @@ function setTasksOpen(open) {
   els.tasksHead.setAttribute('aria-expanded', String(open));
 }
 
-function paintTasks(tasks) {
-  const list = Array.isArray(tasks) ? tasks : [];
-  els.tasksCount.textContent = String(list.length);
-  els.tasksBody.replaceChildren(...taskRows(list));
+function repaintTaskRows() {
+  els.tasksCount.textContent = String(lastTasks.length);
+  els.tasksBody.replaceChildren(...taskRows(lastTasks, S.current, openTaskSheetFromRow));
+}
+
+function paintTasks(list) {
+  lastTasks = Array.isArray(list) ? list : [];
+  repaintTaskRows();
+  const f = taskSheetOpen();
+  if (f && f.sid === S.current) taskSheetUpdate(S.current, lastTasks.find((t) => t && t.id === f.tid));
+}
+
+function openTaskSheetFromRow(t) {
+  openTaskSheet(S.current, String(t.id), t, repaintTaskRows);
 }
 
 async function loadTasks() {
@@ -248,8 +282,10 @@ async function loadTasks() {
     if (mine === tasksReq && id === S.current) paintTasks(r && r.tasks);
   } catch (e) {
     if (mine !== tasksReq || id !== S.current) return;
+    // 501 means the op is not there: a web or stored row, or a pack older than
+    // the tasks op. The body names the fix, so show it instead of a dead end.
     els.tasksBody.replaceChildren(el('p', 'dim', e instanceof ApiError && e.status === 501
-      ? 'This gateway does not report sub-agents.'
+      ? (e.message || 'This gateway does not report sub-agents.')
       : 'Could not load sub-agents: ' + e.message));
   }
 }
@@ -284,6 +320,20 @@ function setMode(next) {
     paintTopbar();
     toast(errText(e, 'Could not change the mode.'), 'err');
   });
+}
+
+/** Flip yolo for the open web row and take the answer the gateway reports. */
+async function toggleYolo() {
+  const s = session();
+  if (!s || s.kind !== 'web') return;
+  try {
+    const r = await api.setYolo(s.id, s.yolo !== true);
+    patchRail(s.id, { yolo: !!(r && r.yolo) });
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 409) toast(YOLO_BUSY);
+    else toast(errText(e, 'Could not change YOLO.'), 'err');
+  }
+  paintTopbar();
 }
 
 /* ------------------------------------------------------------------ composer */
@@ -413,6 +463,14 @@ function onEvent(ev) {
     case 'tasks':
       scheduleTasks(ev.session);
       return;
+    case 'task_focus': {
+      // The terminal changed followed task. "main" clears the marker; unknown
+      // or missing ids are ignored, the rows themselves are refetched by 'tasks'.
+      if (!ev.session || typeof ev.id !== 'string' || !ev.id) return;
+      markFollowed(ev.session, ev.id);
+      if (ev.session === S.current) repaintTaskRows();
+      return;
+    }
     case 'sessions':
       loadSessions();
       return;
@@ -460,7 +518,7 @@ function rail(open) {
 function boot() {
   const ids = {
     scrim: 'scrim', list: 'session-list', title: 'title-btn', kind: 'kind-chip',
-    mode: 'mode-btn', plan: 'plan-btn', search: 'search-btn', stats: 'stats-btn', kill: 'kill-btn',
+    mode: 'mode-btn', yolo: 'yolo-btn', plan: 'plan-btn', search: 'search-btn', stats: 'stats-btn', kill: 'kill-btn',
     offline: 'offline', retry: 'retry-btn', transcript: 'transcript', ro: 'readonly',
     input: 'input', cancel: 'cancel-btn', send: 'send-btn', fab: 'fab',
     tasks: 'tasks', tasksHead: 'tasks-head', tasksBody: 'tasks-body', tasksCount: 'tasks-count',
@@ -474,6 +532,7 @@ function boot() {
   els.scrim.addEventListener('click', () => rail(false));
   els.title.addEventListener('click', rename);
   els.mode.addEventListener('click', () => setMode(S.mode === 'build' ? 'plan' : 'build'));
+  els.yolo.addEventListener('click', toggleYolo);
   els.plan.addEventListener('click', () => session() && planDrawer(S.current));
   els.tasksHead.addEventListener('click', () => setTasksOpen(!tasksOpen));
   els.search.addEventListener('click', () => searchOverlay(selectSession));
@@ -517,7 +576,7 @@ function start() {
     m.install();
     globalThis.maki.mock = {
       emit: m.emit, permission: m.fakePermission, expire: m.expire, drop: m.dropStream, quiet: m.quiet,
-      tasks: m.tasksFor,
+      tasks: m.tasksFor, taskTranscript: m.taskTranscriptFor, oldPlugin: m.oldPlugin,
     };
     boot();
   }, () => boot());

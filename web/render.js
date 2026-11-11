@@ -53,11 +53,11 @@ export function nearBottom(root) {
   return root.scrollHeight - root.scrollTop - root.clientHeight < NEAR;
 }
 
-/** Reconcile the container with S.messages plus the optimistic S.pending tail. */
-export function renderTranscript(root) {
-  const pinned = !root.children.length || nearBottom(root);
-  const top = root.scrollTop;
-  const list = S.pending.length ? S.messages.concat(S.pending) : S.messages;
+/**
+ * Reconcile one message list into any container, reusing keyed rows. Shared by
+ * the main transcript and the task detail sheet, so both paint blocks alike.
+ */
+export function renderMessages(root, list) {
   const pool = new Map();
   for (const n of Array.from(root.children)) if (n.dataset.k) pool.set(n.dataset.k, n);
 
@@ -91,9 +91,15 @@ export function renderTranscript(root) {
     root.insertBefore(n, ref);
   }
   while (ref) { const next = ref.nextSibling; root.removeChild(ref); ref = next; }
-  if (nodes.length) root.querySelector('.empty')?.remove();
-  else root.append(el('div', 'empty', 'No messages yet.'));
+}
 
+/** Reconcile the main container with S.messages plus the optimistic S.pending tail. */
+export function renderTranscript(root) {
+  const pinned = !root.children.length || nearBottom(root);
+  const top = root.scrollTop;
+  renderMessages(root, S.pending.length ? S.messages.concat(S.pending) : S.messages);
+  if (root.children.length) root.querySelector('.empty')?.remove();
+  else root.append(el('div', 'empty', 'No messages yet.'));
   if (pinned) root.scrollTop = root.scrollHeight;
   else if (top) root.scrollTop = top;
 }
