@@ -253,6 +253,21 @@ function H.tasks(_req)
   return protocol.array(tasks)
 end
 
+--- Shows one chat of the session on screen. `id` is a row of the `tasks` op,
+--- and "main" is the main chat. The host takes no session, so it moves the tab
+--- the TUI already has focused.
+function H.task_focus(req)
+  local id = req.id
+  if type(id) ~= "string" or id == "" then
+    return nil, "id is required"
+  end
+  local done, err = host(maki.task.focus, id)
+  if not done then
+    return ui_only(err)
+  end
+  return true
+end
+
 -- ----------------------------------------------------------- run_command
 
 --- /reload rebuilds the plugin host, which would take this plugin, its

@@ -6,7 +6,7 @@ It opens a unix socket and speaks newline-delimited JSON on it. The wire format 
 plugin only serves that socket.
 
 Through the socket a gateway can list the tabs, read a transcript, send a prompt, open a
-background tab, switch mode, rename, notify, read the plan, list tasks, run a slash
+background tab, switch mode, rename, notify, read the plan, list and follow tasks, run a slash
 command, pop the input queue, and answer tool permission prompts. Every state change in
 any tab comes back out as an event line.
 
@@ -149,8 +149,12 @@ per project, because tabs belong to the maki process that opened them.
 ## Events
 
 A connection that sent `hello` receives every event for the life of the plugin: `status`,
-`turn_start`, `turn_end`, `tool_start`, `tool_done`, `title`, `model`, `question`, and, while
-the permission bridge is on, `permission` and `permission_cancel`.
+`turn_start`, `turn_end`, `tool_start`, `tool_done`, `title`, `model`, `question`, `task_focus`,
+and, while the permission bridge is on, `permission` and `permission_cancel`.
+
+`task_focus` means the person at the terminal changed the followed task with the chat cycling
+keys. It carries the `id` of the task now focused. The host payload names no session, so
+`session` is the tab on screen, which is the one the event is about.
 
 The permission bridge stays off until a gateway sends `{"op":"permissions","on":true}`. From
 then on a tool call that would show a permission prompt becomes a `permission` event with a
@@ -173,6 +177,9 @@ the terminal prompt appear, and sends `permission_cancel` so the dialog can be d
   lower `last`.
 - `pop_queue` acts on the focused tab, because the host has no call for another one. A
   `session` that is not the focused tab returns an error.
+- `task_focus` follows one chat of the tab the terminal already has focused. Its `id` is a row
+  of `tasks`, and `main` is the main chat. The host has no session argument, so another tab is
+  out of reach, and an unknown id comes back as the host error.
 - `run_command` rejects a `/reload` command line. It would rebuild the plugin host and take
   this plugin, its listener, and every open connection with it.
 - The socket closes when the plugin unloads or maki exits, and the file goes with it. After a

@@ -129,6 +129,16 @@ local EVENTS = {
       return {}
     end,
   },
+  -- The terminal user changed followed task with the chat cycling keys. The host
+  -- payload carries no session, so `session` is the tab on screen, and `id` is
+  -- the row of the `tasks` op now focused ("main" for the main chat).
+  {
+    host = "TaskFocusChanged",
+    wire = "task_focus",
+    build = function(d)
+      return { id = protocol.str(d.id) }
+    end,
+  },
 }
 
 --- A host event as one fan-out call. Handlers only queue a line, so they never
