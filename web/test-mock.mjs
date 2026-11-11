@@ -206,6 +206,21 @@ check('image placeholder', has(tr, 'imgph').length === 1);
 check('cards collapsed by default', has(tr, 'card-body').every((b) => b.hidden === true));
 check('expand set starts empty', M.S.open.size === 0);
 
+/* blocks in the seeded transcript: the chat path must paint what the TUI paints */
+const seed = has(tr, 'md').map((m) => m._html).join('\n');
+check('seeded transcript paints one semantic table', (seed.match(/<table class="table"/g) || []).length === 1
+  && seed.includes('<thead><tr>') && seed.includes('<tbody><tr>'), (seed.match(/<table/g) || []).length);
+check('seeded table header carries the three GFM alignments', seed.includes(
+  '<th style="text-align:left">Route</th><th style="text-align:center">Verb</th><th style="text-align:right">Body</th>'));
+check('seeded cell keeps a pipe inside a code span in one cell',
+  seed.includes('<td style="text-align:right"><code class="ic">plan|execute</code></td>'));
+check('seeded cell stays escaped inside a code span',
+  seed.includes('<td style="text-align:right"><code class="ic">&lt;script&gt;alert(1)&lt;/script&gt;</code></td>'));
+check('seeded transcript paints a heading', seed.includes('<h2>What the browser may send</h2>'));
+check('seeded transcript nests a bullet list by two spaces',
+  seed.includes('<code class="ic">{text}</code><ul><li>the answer is an SSE stream'));
+check('seeded markdown leaks no placeholder', !seed.includes('\u0000'));
+
 /* expand survives a refetch; rows are reused, not rebuilt */
 has(tr, 'card-head')[0].fire('click');
 check('card expands', has(tr, 'card-body')[0].hidden === false);
@@ -241,6 +256,10 @@ el('input').value = 'draft for live';
 el('plan-btn').fire('click');
 await tick(500);
 check('plan drawer renders content', txt(top()).includes('reconcile'), txt(top()).slice(0, 60));
+const planMd = has(top(), 'md')[0]._html;
+check('plan drawer paints a heading and an ordered list', planMd.includes('<h1>Plan: reconcile loop</h1>')
+  && planMd.includes('<ol><li>Key rows by a stable message key.</li>')
+  && planMd.includes('<strong>Status:</strong>'), planMd.slice(0, 80));
 top().querySelector('.icon').fire('click');
 check('drawer closed', el('overlays').childElementCount === 0);
 
@@ -896,6 +915,64 @@ check('orphan result rebuilds a failed card of its own', !!solo && solo.classNam
   && has(solo, 'card-label').length === 1 && txt(has(solo, 'card-label')[0]) === 'error', txt(solo).slice(0, 60));
 M.S.messages = saveMsgs;
 M.S.pending = savePend;
+
+/* markdown unit: the block subset md.js adds for transcripts. One source covers every block,
+   so the shape assertions read against one render instead of a dozen small ones. */
+const { markdown: md } = await import(WEB + 'md.js');
+const { mdBox } = await import(WEB + 'ui.js');
+const DOC = [
+  '# Title',
+  'intro line',
+  '| name | verb | note |',
+  '| :--- | :-: | ---: |',
+  '| `a|b` | **POST** | [spec](https://example.com/s) |',
+  '| <script>alert(1)</script> | GET | pipe \\| kept |',
+  '| short |',
+  '',
+  'plain | line | only',
+  '',
+  '- one',
+  '  - two',
+  '    - three',
+  '3. five',
+  '',
+  '> quoted **bold**',
+  '> more',
+  '',
+  '***',
+  '',
+  '```',
+  'raw | not | a | table',
+  '```',
+].join('\n');
+const H = md(DOC);
+const count = (re) => (H.match(re) || []).length;
+check('markdown: heading levels stop at six', md('###### six\n####### seven') === '<h6>six</h6><p>####### seven</p>',
+  md('###### six\n####### seven'));
+check('markdown: bullets nest by two spaces',
+  H.includes('<ul><li>one<ul><li>two<ul><li>three</li></ul></li></ul></li></ul>'));
+check('markdown: a marker change starts a second list', md('- a\n1. b') === '<ul><li>a</li></ul><ol><li>b</li></ol>',
+  md('- a\n1. b'));
+check('markdown: an ordered list keeps its first number', md('5. five\n6. six').includes('<ol start="5">'));
+check('markdown: quote lines fold into one blockquote', H.includes('<blockquote><p>quoted <strong>bold</strong><br>more</p></blockquote>'));
+check('markdown: a rule line renders a thematic break', H.includes('<hr>'));
+check('markdown: table renders th and td under thead and tbody', count(/<th[ >]/g) === 3 && count(/<td[ >]/g) === 9
+  && H.includes('<thead><tr>') && H.includes('<tbody><tr>'), count(/<td[ >]/g));
+check('markdown: cell content runs the inline pipeline', H.includes('<td style="text-align:center"><strong>POST</strong></td>')
+  && H.includes('<td style="text-align:right"><a href="https://example.com/s"'));
+check('markdown: a pipe inside a code span stays in its cell', H.includes('<td style="text-align:left"><code class="ic">a|b</code></td>'));
+check('markdown: an escaped pipe stays in its cell', H.includes('<td style="text-align:right">pipe | kept</td>'));
+check('markdown: html in a cell stays escaped', H.includes('<td style="text-align:left">&lt;script&gt;alert(1)&lt;/script&gt;</td>')
+  && !/<script>/i.test(H));
+check('markdown: a short row pads to the header columns',
+  H.includes('<td style="text-align:left">short</td><td style="text-align:center"></td><td style="text-align:right"></td></tr>'));
+check('markdown: a pipe line with no delimiter row stays a paragraph', H.includes('<p>plain | line | only</p>') && count(/<table/g) === 1);
+check('markdown: a table interrupts a paragraph', H.includes('<p>intro line</p><div class="table-wrap">'));
+check('markdown: a fence keeps its pipes as code', H.includes('<pre class="code"><code>raw | not | a | table</code></pre>'));
+check('markdown: no placeholder survives the render', !H.includes('\u0000')
+  && md('**a `b` c**') === '<p><strong>a <code class="ic">b</code> c</strong></p>', md('**a `b` c**'));
+check('markdown: the sheet helper renders the same blocks', mdBox('| k | v |\n| --- | --- |\n| `x|y` | 1 |')._html
+  .includes('<tbody><tr><td><code class="ic">x|y</code></td><td>1</td></tr></tbody>'));
 
 console.log('\n--- transcript tail ---');
 console.log(tr.children.slice(-3).map((c) => c.className + ' :: ' + txt(c).replace(/\s+/g, ' ').slice(0, 100)).join('\n'));

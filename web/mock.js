@@ -91,7 +91,7 @@ const transcripts = {
         { type: 'tool_result', tool_use_id: 'tu_1', content: [{ type: 'text', text: longOutput }] },
         {
           type: 'text',
-          text: 'Four POST routes matter:\n\n- `/api/sessions/{id}/prompt` with `{text}`\n- `/api/sessions/{id}/cancel`, 501 for live\n- `/api/sessions/{id}/mode` with `{mode}`\n- `/api/permissions/{engine}/{request_id}`\n\nSee `docs/CONTRACTS.md:22` and [the spec](https://example.com/acp).\n\n```\njson\n{"state": "queued"}\n```\n\nEscape check: <script>alert(1)</script>, **bold**, _italic_, `raw`.',
+          text: '## What the browser may send\n\nFour POST routes matter:\n\n- `/api/sessions/{id}/prompt` with `{text}`\n  - the answer is an SSE stream, not one JSON body\n  - a second prompt while the run is busy gets 409\n- `/api/sessions/{id}/cancel`, 501 for live\n- `/api/sessions/{id}/mode` with `{mode}`\n- `/api/permissions/{engine}/{request_id}`\n\nSee `docs/CONTRACTS.md:22` and [the spec](https://example.com/acp).\n\n```\njson\n{"state": "queued"}\n```\n\n| Route | Verb | Body |\n| :--- | :---: | ---: |\n| `prompt` | POST | `{text}` |\n| `mode` | POST | `plan|execute` |\n| `permissions` | POST | `<script>alert(1)</script>` |\n\nEscape check: <script>alert(1)</script>, **bold**, _italic_, `raw`.',
         },
         { type: 'image', mimeType: 'image/png' },
       ],

@@ -10,7 +10,7 @@ Automated, no browser needed. It drives the real modules through a DOM shim and
 prints one line per check:
 
 ```
-cd maki-gateway/web && node test-mock.mjs     # 247 checks, then ALL CHECKS PASSED
+cd maki-gateway/web && node test-mock.mjs     # 272 checks, then ALL CHECKS PASSED
 ```
 
 By hand, in a browser:
@@ -82,7 +82,8 @@ always rejects a toggle, and it replies 501 for the live and stored rows.
 ## Transcript
 
 13. `web-1` shows: a thinking section (collapsed), a read tool card, a result, a
-    paragraph with bold text, a code fence, and a link.
+    heading, a paragraph with bold text, a bullet list with two nested items, a code
+    fence, a link, and a 3-column table. Items 55 to 58 check the new blocks.
 14. The tool card is collapsed. Expand it: the input is pretty JSON. The result is
     inside the same card. A long result ends with "show all (N chars)".
 15. `live-1` shows a failed card in red with an "error" label, an image placeholder,
@@ -212,6 +213,39 @@ always rejects a toggle, and it replies 501 for the live and stored rows.
     live-session action". Run `maki.api.taskFocus('live-1', 'nope')`: 404 with "no task with id
     nope". Run `maki.mock.oldPlugin('live-1')` and follow again: 501 with "no interactive UI
     attached", the verbatim plugin error under the status its sentinel picks.
+
+## Markdown blocks and TUI parity
+
+`web/md.js` is the only markup step for message text. It escapes first, then splits
+blocks, then applies the inline rules. The terminal runs `maki-markdown` on the same
+text, so both show the same structure. Read these items next to the terminal.
+
+55. Open `web-1`. The assistant answer starts with an h2 heading ("What the browser may
+    send"), then a bullet list whose first item holds two nested items, then a code
+    fence, then a 3-column table. On a phone width the table scrolls sideways inside its
+    own wrapper, and the message body keeps its width.
+56. Read the table: the Route column is left aligned, Verb is centered, Body is right
+    aligned. `plan|execute` stays one cell in monospace, so the pipe inside the code span
+    did not split the row. The last cell prints `<script>alert(1)</script>` as text, with
+    no popup. Open the page source: inside the transcript the markup reads `&lt;script&gt;`.
+57. Open the plan drawer on `live-1` (item 11). Its title shows as an h1 and its three
+    steps as a numbered list, so the drawer and the task sheet use the same renderer as
+    the chat.
+58. Compare with the terminal on the same text. The heading, the list nesting, the table
+    columns, and the alignments carry over. The gaps below are known, so do not
+    chase them during a review:
+
+- The web code fence has no syntax highlighting. The terminal colors every token.
+- The terminal draws a box with column borders around a table. The web draws a rule under
+  the header and between rows only.
+- A row without outer pipes (`a | b` over `--- | ---`) is a table in the web client. The
+  terminal needs `| a | b |` and shows that pair as plain text.
+- A body row with more cells than the header keeps the header column count in the web and
+  adds columns in the terminal.
+- `> quote` renders as a quote block in the web client. The terminal has no blockquote, so
+  it prints the line as text.
+- A table that is still streaming shows raw pipes until its delimiter row arrives. Both
+  sides behave like that, because a table needs that row.
 
 ## Notes for the real gateway
 
