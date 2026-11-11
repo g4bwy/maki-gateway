@@ -10,7 +10,7 @@ Automated, no browser needed. It drives the real modules through a DOM shim and
 prints one line per check:
 
 ```
-cd maki-gateway/web && node test-mock.mjs     # 113 checks, then ALL CHECKS PASSED
+cd maki-gateway/web && node test-mock.mjs     # 185 checks, then ALL CHECKS PASSED
 ```
 
 By hand, in a browser:
@@ -26,23 +26,18 @@ few paths on demand:
 ```
 maki.mock.permission('live-1')               // open a permission dialog now
 maki.mock.emit('notice', { text: 'hello' })  // any SSE envelope
+maki.mock.emit('tasks', { session: 'live-1' })  // a task changed: the panel refetches
+maki.mock.tasks('live-1', [])                // the rows live-1 reports from now on
 maki.mock.expire('acp', 101)                 // next answer to id 101 replies 404
 maki.mock.drop(6)                            // cut the fake stream for 6 s
 maki.mock.quiet()                            // stop the background status traffic
 ```
 
-From the browser console the mock answers to `maki.mock`:
-
-```
-maki.mock.permission('live-1')     // a permission dialog, attach engine
-maki.mock.emit('notice', { text: 'hi' })
-maki.mock.expire('acp', 101)       // next answer to id 101 replies 404
-maki.mock.drop(6)                  // kill the fake stream for 6 s
-maki.mock.quiet()                  // stop the background status and session events
-```
-
 Mock sessions: `web-1` (kind web, streaming), `live-1` (kind live, dirty refetch),
-`sto-1` (kind stored, read only). Creating a chat adds a new `web-*` session.
+`sto-1` (kind stored, read only). Creating a chat adds a new `web-*` session. `live-1`
+reports two fake sub-agent tasks (one working, one done); every other kind answers 501
+for the task list, like the gateway does. A chat created with the yolo box ticked
+answers its own permission prompts, so no dialog opens for it.
 
 ## Layout and style
 
@@ -118,13 +113,44 @@ Mock sessions: `web-1` (kind web, streaming), `live-1` (kind live, dirty refetch
 32. `?token=demo` in the URL: check the Network tab that `/api/events?token=demo` and
     every fetch carry the token.
 
+## Yolo, always-allow, and sub-agents
+
+33. New chat: the form has a yolo box under the model field, labelled "yolo — skip
+    permission prompts, deny rules still apply". Leave it empty and watch the Network
+    tab: the POST body has no `yolo` key at all.
+34. Tick it, start the chat, then open the dialog again for the same folder: the box
+    comes back ticked. Type a different folder and it goes back to unticked. The choice
+    lives in `localStorage` under `maki.yolo`, one entry per folder.
+35. Start a chat with yolo ticked and a first prompt: that session streams its turn and
+    never opens a permission dialog, because the mock spawns it the way `--yolo` does.
+36. Ask a `web` session for permission (`maki.mock.permission('web-1')` after opening it,
+    or wait for the scripted ask): the dialog offers Deny, Allow once, and Always allow,
+    and Always allow is the blue one. It posts `{"decision":"allow_always"}`.
+37. Ask a `live` session (`maki.mock.permission('live-1')`): only Deny and Allow once
+    show. The attach bridge has no "remember this" answer, so the button would lie.
+38. Deny with text in the guidance box: the plan drawer picks that text up, as before.
+39. Open `live-1`: a "Sub-agents" section sits under the top bar with a count of 2, one
+    row spinning and one done. Each row shows the fields its task carries (name, tool,
+    cost, elapsed time) and folds the rest as JSON. `web-1` and `sto-1` have no section.
+40. With `live-1` open, run `maki.mock.tasks('live-1', [])` then
+    `maki.mock.emit('tasks', { session: 'live-1' })`: after half a second the panel
+    refetches and reads "none running". Three `tasks` events in a row refetch once.
+41. Reload on a phone width: the section starts collapsed, and its own header folds it.
+    That does not touch the session rail, which folds separately.
+
 ## Notes for the real gateway
 
 - `store.js:api` is the whole request surface. If the gateway renames a field, fix it
   in `store.js` or `render.js` only.
+- Task rows arrive from `maki.task.list()` untouched, and the gateway only answers them
+  for a live tab. Row 1 of that list is the main chat: it carries no `status`. The panel
+  paints a plain ring for any row whose status it does not know, and keeps the fields it
+  cannot show behind the JSON fold.
 - Unknown message, block, or ACP shapes render as raw JSON rather than dropping text.
 - The renderer trusts only `http:`, `https:`, and `mailto:` links.
 - No endpoint reports the current mode, so the build/plan chip label is optimistic. It
   rolls back when the POST fails, and it follows the server when an ACP
   `current_mode_update` arrives. A `mode` field on `Session` would settle it.
-- `dirty` for a session that is not open is ignored: opening it fetches anyway.
+- `dirty` for a session that is not open is ignored: opening it fetches anyway. The same
+  holds for `tasks`. The `tasks` op reports the tab the TUI has focused, which is not
+  always the tab the event names, so a row set can describe another tab.

@@ -44,6 +44,13 @@
       </button>
     </header>
 
+    <div id="tasks" hidden>
+      <button id="tasks-head" class="fold-head" type="button" aria-expanded="true" aria-controls="tasks-body">
+        <span>Sub-agents</span><span id="tasks-count" class="chip"></span>
+      </button>
+      <div id="tasks-body" class="fold-body tasks" hidden></div>
+    </div>
+
     <div id="offline" hidden>
       <span>Disconnected from the gateway. Retrying.</span>
       <button id="retry-btn" type="button">Retry now</button>

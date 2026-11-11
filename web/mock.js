@@ -23,6 +23,29 @@ const sessions = [
   { id: 'sto-1', kind: 'stored', title: 'Lua plugin notes', status: 'idle', cwd: '/home/gab/test/maki/plugins', model: 'claude-haiku', updated_at: now() - 90000 },
 ];
 
+/** Decisions the permission endpoint takes. Anything else is a client bug. */
+const DECISIONS = new Set(['allow', 'allow_always', 'deny']);
+const TASKS_LATER = 300;
+
+/**
+ * Fake maki.task.list rows per live session. Field names and shapes follow the
+ * engine (id, session, name, status, tool, cost, times), and one row carries a
+ * key maki never sends (probe) so the JSON fold path has something to show.
+ */
+const tasks = {
+  'live-1': [
+    {
+      id: 't-7', session: '01J8TQ', name: 'audit the reconcile pass', status: 'working', tool: 'task',
+      cost: 0.0021, started_at: now() - 90, focused: false,
+      probe: [{ id: 't-7:bash', tool: 'bash', status: 'working' }],
+    },
+    {
+      id: 't-8', session: '01J8TQ', name: 'collect contract notes', status: 'done', tool: 'task',
+      cost: 0.011, started_at: now() - 400, ended_at: now() - 60, wrapper: true,
+    },
+  ],
+};
+
 const longOutput = 'GET /api/sessions 200 ok\n' + '  120 lines of file output\n'.repeat(28);
 const transcripts = {
   'web-1': [
@@ -145,6 +168,30 @@ async function webTurn(id, text) {
   });
   await sleep(400);
   send({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\n\nNow I want to write the fix. ' } });
+  if (!(await permissionRound(id, send))) return;
+  const editId = 'tc_' + (++seq);
+  send({ sessionUpdate: 'tool_call', toolCallId: editId, name: 'edit', status: 'completed', rawInput: { path: 'web/render.js' }, rawOutput: { bytes: 412 } });
+  await sleep(500);
+  send({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done. Rows are reused across refetches now.' } });
+  await sleep(400);
+  send({ sessionUpdate: 'usage_update', usage: { input: 41200, output: 3200, cache_read: 88000 }, size: 118000, cost: 0.0412 });
+  endTurn(id, 'Reconcile is patched. Mock turn over.');
+}
+
+/**
+ * The permission ask of a turn. A session created with yolo was spawned with
+ * --yolo, so its prompts are answered without ever reaching the browser
+ * (CONTRACTS 2). Returns false when the ask fell through to the terminal.
+ */
+async function permissionRound(id, send) {
+  if ((current(id) || {}).yolo === true) {
+    send({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Spawned with --yolo, so this ask answered itself. ' },
+    });
+    await sleep(400);
+    return true;
+  }
   await sleep(6000);
   const requestId = ++seq;
   emit('permission', {
@@ -160,18 +207,10 @@ async function webTurn(id, text) {
   setStatus(id, 'needs_input');
   const answered = await waitForAnswer(requestId, 55000);
   setStatus(id, 'working');
-  if (!answered) {
-    send({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'No answer arrived, so I stop here.' } });
-    endTurn(id, 'The permission request fell through to the terminal.');
-    return;
-  }
-  const editId = 'tc_' + (++seq);
-  send({ sessionUpdate: 'tool_call', toolCallId: editId, name: 'edit', status: 'completed', rawInput: { path: 'web/render.js' }, rawOutput: { bytes: 412 } });
-  await sleep(500);
-  send({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done. Rows are reused across refetches now.' } });
-  await sleep(400);
-  send({ sessionUpdate: 'usage_update', usage: { input: 41200, output: 3200, cache_read: 88000 }, size: 118000, cost: 0.0412 });
-  endTurn(id, 'Reconcile is patched. Mock turn over.');
+  if (answered) return true;
+  send({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'No answer arrived, so I stop here.' } });
+  endTurn(id, 'The permission request fell through to the terminal.');
+  return false;
 }
 
 /** Resolve true when the browser answers this request id before the timeout. */
@@ -204,7 +243,11 @@ function create(body) {
   const cwd = String((body && body.cwd) || '');
   if (!cwd) return http(400, 'cwd is required');
   const id = 'web-' + (++seq);
-  sessions.unshift({ id, kind: 'web', title: '', status: 'idle', cwd, model: body.model || 'mock-model', updated_at: now() });
+  const s = { id, kind: 'web', title: '', status: 'idle', cwd, model: body.model || 'mock-model', updated_at: now() };
+  // Mock only: the gateway reports no yolo field on a row. Keeping it here lets the
+  // scripted turn skip its prompts, the way a --yolo child does.
+  if (body && body.yolo === true) s.yolo = true;
+  sessions.unshift(s);
   transcripts[id] = [];
   emit('sessions', {});
   Promise.resolve().then(() => {
@@ -227,13 +270,23 @@ const messages = (id) => {
 
 function permission(engine, requestId, decision, guidance) {
   const key = pkey(engine, requestId);
+  // Same order as the gateway: a bad decision is 400 even for an expired request.
+  if (!DECISIONS.has(decision)) return http(400, 'unknown decision ' + decision);
   if (!live.has(key)) return http(404, 'expired');
   live.delete(key);
   if (decision === 'deny' && guidance) planBody = '# Plan\n\nMock notes from the deny guidance: ' + guidance + '\n';
   const waiter = waiting.get(key);
   waiting.delete(key);
-  if (waiter) waiter();
+  if (waiter) waiter(decision);
   return ok({ ok: true });
+}
+
+/** Tasks of a live session, as GET /api/sessions/{id}/tasks answers. */
+function tasksOf(id) {
+  const s = current(id);
+  if (!s) return http(404, 'unknown session ' + id);
+  if (s.kind !== 'live') return http(501, 'tasks are only available for live sessions');
+  return ok({ tasks: clone(tasks[id] || []) });
 }
 
 function search(q) {
@@ -305,6 +358,7 @@ function route(method, path, body) {
   if (p === '/api/sessions' && method === 'GET') return ok(clone(sessions));
   if (p === '/api/sessions' && method === 'POST') return create(body);
   if (seg[1] === 'sessions' && seg[3] === 'messages') return messages(id);
+  if (seg[1] === 'sessions' && seg[3] === 'tasks') return tasksOf(id);
   if (seg[1] === 'permissions') return permission(seg[2], Number(seg[3]), body && body.decision, body && body.guidance);
   if (seg[1] === 'plan') {
     if (s && s.kind === 'web') return http(501, 'plan is only available for live sessions');
@@ -404,11 +458,25 @@ export function dropStream(seconds = 2) {
 /** Push a permission ask for one session, with no turn behind it. */
 export function fakePermission(id, requestId) {
   const s = current(id || 'live-1');
+  const engine = s && s.kind === 'live' ? 'attach' : 'acp';
+  const rid = requestId || ++seq;
   emit('permission', {
-    session: s ? s.id : 'live-1', engine: s && s.kind === 'live' ? 'attach' : 'acp',
-    request_id: requestId || ++seq, tool: 'bash',
+    session: s ? s.id : 'live-1', engine, request_id: rid, tool: 'bash',
     input: { command: 'git push origin HEAD', note: 'Stand-alone mock request, no turn behind it.' },
   });
+  // Answering with an allow lets the round spawn work, so the mock reports a task
+  // change the way the gateway does. A deny spawns nothing and raises no event.
+  const key = pkey(engine, rid);
+  if (s) {
+    waiting.set(key, (verdict) => {
+      if (verdict !== 'deny') setTimeout(() => emit('tasks', { session: s.id }), TASKS_LATER);
+    });
+  }
+}
+
+/** Set the rows a live session reports, so the panel can be driven empty or full. */
+export function tasksFor(id, list) {
+  tasks[id] = Array.isArray(list) ? list : [];
 }
 
 /** Forget a request id, so the next answer replies 404 expired. */

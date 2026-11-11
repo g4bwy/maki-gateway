@@ -140,17 +140,38 @@ const waitFor = async (what, cond, ms = 9000) => {
 
 const need = ['rail-toggle', 'rail-close', 'session-list', 'scrim', 'title-btn', 'kind-chip', 'mode-btn',
   'plan-btn', 'search-btn', 'stats-btn', 'kill-btn', 'offline', 'retry-btn', 'transcript', 'readonly',
-  'input', 'cancel-btn', 'send-btn', 'fab', 'overlays', 'toasts'];
+  'input', 'cancel-btn', 'send-btn', 'fab', 'overlays', 'toasts',
+  'tasks', 'tasks-head', 'tasks-body', 'tasks-count'];
 check('index.html has every id app.js looks up', need.every((i) => !!el(i)), need.filter((i) => !el(i)).join(','));
 
 await import(WEB + 'app.js');
 const mock = await import(WEB + 'mock.js');
+const store = await import(WEB + 'store.js');
 mock.quiet();
 const f0 = globalThis.fetch;
+const calls = [];
 globalThis.fetch = async (u, i) => {
+  const url = typeof u === 'string' ? u : u.url;
+  let body = null;
+  try { body = i && i.body ? JSON.parse(i.body) : null; } catch { body = i && i.body; }
+  calls.push({ method: (i && i.method) || 'GET', url, body });
   const r = await f0(u, i);
-  if (r.status >= 400) console.log('HTTP' + r.status, (i && i.method) || 'GET', typeof u === 'string' ? u : u.url);
+  if (r.status >= 400) console.log('HTTP' + r.status, (i && i.method) || 'GET', url);
   return r;
+};
+/** Last recorded call whose url matches, optionally filtered by method. */
+const lastCall = (re, method) => calls.filter((c) => (!method || c.method === method) && re.test(c.url)).at(-1);
+const callCount = (re) => calls.filter((c) => re.test(c.url)).length;
+/** Run fn with fetch stubbed, and hand back the bodies it sent. */
+const probeBodies = async (fn) => {
+  const real = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (u, i) => {
+    seen.push(i && i.body ? JSON.parse(i.body) : null);
+    return new Response('{"session":"probe"}', { status: 201, headers: { 'content-type': 'application/json' } });
+  };
+  try { await fn(); } finally { globalThis.fetch = real; }
+  return seen;
 };
 await tick(600);
 const M = globalThis.maki;
@@ -260,6 +281,117 @@ await tick(400);
 check('draft kept per session', el('input').value === 'draft kept here', el('input').value);
 el('input').value = '';
 
+/* sub-agents panel: live only, rows from GET /api/sessions/{id}/tasks */
+const tasksCalls = () => callCount(/\/api\/sessions\/live-1\/tasks$/);
+const trows = () => has(el('tasks-body'), 'task');
+check('live: sub-agents panel visible', el('tasks').hidden === false);
+check('the section is expanded by default on a wide screen', el('tasks-body').hidden === false);
+check('task rows rendered from the tasks endpoint',
+  await waitFor('task rows', () => trows().length === 2), txt(el('tasks-body')).slice(0, 70));
+check('tasks fetched when the live session opens', tasksCalls() >= 1, tasksCalls());
+check('task count badge', txt(el('tasks-count')) === '2', txt(el('tasks-count')));
+check('every task row carries one status dot', trows().every((r) => has(r, 'st').length === 1));
+check('working task reuses the spinner dot',
+  trows().some((r) => has(r, 'st')[0].className.includes('st working')), txt(trows()[0]));
+check('done task gets its own dot state',
+  trows().some((r) => has(r, 'st')[0].className.includes('st done')), txt(trows()[1]));
+check('known scalar fields show as name/value pairs',
+  txt(trows()[0]).includes('name') && txt(trows()[0]).includes('audit the reconcile pass')
+  && txt(trows()[0]).includes('01J8TQ') && txt(trows()[0]).includes('$0.0021'), txt(trows()[0]));
+check('nested task fields fold behind JSON',
+  has(el('tasks-body'), 'extra').length === 1 && txt(has(el('tasks-body'), 'extra')[0]).includes('probe'));
+check('times read as relative labels', /\d+m|h/.test(txt(trows()[1])), txt(trows()[1]));
+
+let base = tasksCalls();
+await M.resync();
+await tick(500);
+check('resync refetches tasks for the open live session', tasksCalls() === base + 1, tasksCalls() - base);
+mock.emit('tasks', { session: 'web-1' });
+await tick(900);
+check('tasks event for another session refetches nothing', tasksCalls() === base + 1, tasksCalls() - base);
+base = tasksCalls();
+mock.emit('tasks', { session: 'live-1' });
+mock.emit('tasks', { session: 'live-1' });
+mock.emit('tasks', { session: 'live-1' });
+await tick(1500);
+check('tasks events debounce into one refetch for the open session',
+  tasksCalls() === base + 1, tasksCalls() - base);
+
+mock.fakePermission('live-1', 777);
+await tick(300);
+const roundFrom = tasksCalls();
+btn('primary').fire('click');
+check('the answered bash round raises a tasks event the panel acts on',
+  await waitFor('tasks after allow', () => tasksCalls() > roundFrom, 5000), tasksCalls() - roundFrom);
+mock.fakePermission('live-1', 778);
+await tick(300);
+const deniedFrom = tasksCalls();
+btn('danger').fire('click');
+await tick(1400);
+check('a denied bash round raises no tasks event', tasksCalls() === deniedFrom, tasksCalls() - deniedFrom);
+
+mock.tasksFor('live-1', []);
+mock.emit('tasks', { session: 'live-1' });
+check('empty state after a tasks event',
+  await waitFor('empty panel', () => txt(el('tasks-body')).includes('none running')), txt(el('tasks-body')));
+check('empty state badge reads zero', txt(el('tasks-count')) === '0', txt(el('tasks-count')));
+
+mock.tasksFor('live-1', [
+  { id: 'x1', status: 'queued_by_backend', note: 'unknown status', flag: true, deep: { nested: [1, 2] } },
+  'a bare string row',
+  { label: 'no status at all' },
+]);
+mock.emit('tasks', { session: 'live-1' });
+check('odd payloads still render rows', await waitFor('odd rows', () => trows().length === 3), txt(el('tasks-body')));
+check('unknown task status still gets a dot', trows().every((r) => has(r, 'st').length === 1));
+check('unlisted status falls back to the idle dot',
+  has(trows()[0], 'st')[0].className.includes('idle'), has(trows()[0], 'st')[0].className);
+check('unknown scalar fields show and nested ones fold',
+  txt(trows()[0]).includes('unknown status') && txt(trows()[0]).includes('yes')
+  && has(trows()[0], 'extra').length === 1, txt(trows()[0]));
+check('a row that is not an object is shown raw', txt(trows()[1]).includes('bare string'), txt(trows()[1]));
+check('a row with no status still shows its label', txt(trows()[2]).includes('no status at all'), txt(trows()[2]));
+
+mock.tasksFor('live-1', [
+  { id: 't-7', name: 'review the reconcile pass', status: 'working' },
+  { id: 't-8', name: 'collect contract notes', status: 'done' },
+]);
+mock.emit('tasks', { session: 'live-1' });
+check('a refresh keeps the rows on screen while it loads', trows().length === 3, trows().length);
+check('restored rows render',
+  await waitFor('two rows', () => trows().length === 2 && txt(el('tasks-body')).includes('review the reconcile pass')),
+  txt(el('tasks-body')));
+el('tasks-head').fire('click');
+check('sub-agents section collapses',
+  el('tasks-body').hidden === true && el('tasks-head').getAttribute('aria-expanded') === 'false');
+el('tasks-head').fire('click');
+check('sub-agents section expands again',
+  el('tasks-body').hidden === false && trows().length === 2 && txt(el('tasks-count')) === '2', txt(el('tasks-count')));
+
+const allTasks = () => callCount(/\/tasks$/);
+M.selectSession('web-1');
+const noTasksFor = allTasks();
+await tick(500);
+check('web: sub-agents panel hidden and emptied',
+  el('tasks').hidden === true && el('tasks-body').childElementCount === 0);
+check('no tasks request is sent for a web session', allTasks() === noTasksFor, allTasks() - noTasksFor);
+M.selectSession('sto-1');
+await tick(400);
+check('stored: sub-agents panel hidden', el('tasks').hidden === true);
+check('no tasks request is sent for a stored session', allTasks() === noTasksFor, allTasks() - noTasksFor);
+const e501 = await store.api.tasks('web-1').then(() => null, (e) => e);
+check('tasks for a web session answers 501', !!e501 && e501.status === 501, e501 && e501.status);
+const switched = allTasks();
+await M.selectSession('live-1');
+check('panel returns on a switch back to live', el('tasks').hidden === false);
+await tick(600);
+check('switching back to live asks for the rows again', allTasks() === switched + 1, allTasks() - switched);
+check('the live rows are on screen after the switch',
+  await waitFor('rows back', () => trows().length === 2 && txt(el('tasks-body')).includes('review the reconcile pass')),
+  txt(el('tasks-body')));
+M.selectSession('web-1');
+await tick(400);
+
 /* mode chip */
 M.selectSession('web-1');
 await tick(500);
@@ -275,11 +407,18 @@ check('permission layer opened', el('overlays').childElementCount === 1);
 check('permission names the tool', txt(top()).includes('bash'), txt(top()).slice(0, 60));
 check('permission shows JSON input', has(top(), 'out').some((o) => txt(o).includes('git push')));
 check('modal tracked by engine:id', [...M.S.modals.keys()].join() === 'attach:101', [...M.S.modals.keys()].join());
+check('live modal: two buttons only', has(top(), 'btn').length === 2, has(top(), 'btn').map((b) => txt(b)).join('|'));
+check('live modal hides Always allow', !txt(top()).includes('Always allow'), txt(top()).slice(0, 90));
+check('live modal: Allow once is primary', txt(btn('primary')) === 'Allow once', txt(btn('primary')));
 top().querySelector('textarea').value = 'use --dry-run';
 btn('danger').fire('click');
 await tick(600);
 check('answered modal closed', el('overlays').childElementCount === 0 && M.S.modals.size === 0);
 check('deny toast', has(el('toasts'), 'toast').some((t) => /Denied bash/.test(txt(t))), txt(has(el('toasts'), 'toast').at(-1)));
+const denyCall = lastCall(/api\/permissions\/attach\/101$/);
+check('deny posts deny with the guidance',
+  !!denyCall && denyCall.body.decision === 'deny' && denyCall.body.guidance === 'use --dry-run',
+  JSON.stringify(denyCall && denyCall.body));
 
 /* stacked modals and permission_cancel */
 mock.fakePermission('live-1', 108);
@@ -300,6 +439,10 @@ mock.expire('attach', 902);
 btn('primary').fire('click');
 await tick(600);
 check('expired answer closes with a toast', M.S.modals.size === 0 && has(el('toasts'), 'toast').some((t) => /expired/i.test(txt(t))), txt(has(el('toasts'), 'toast').at(-1)));
+const liveAllow = lastCall(/api\/permissions\/attach\/902$/);
+check('live Allow once posts allow with no guidance',
+  !!liveAllow && liveAllow.body.decision === 'allow' && !('guidance' in liveAllow.body),
+  JSON.stringify(liveAllow && liveAllow.body));
 
 /* search overlay */
 el('search-btn').fire('click');
@@ -341,7 +484,13 @@ await tick(200);
 console.log('DBG layers', el('overlays').childElementCount, 'heads', has(el('overlays'), 'lhead').map((h) => txt(h).slice(0, 20)));
 const inputs = top().querySelectorAll('input');
 console.log('LAYERS', el('overlays').childElementCount, has(el('overlays'),'lhead').map((h)=>txt(h)));
-check('form has cwd and model fields', inputs.length === 2, top().kids.length && inputs.map((x) => x.tagName + ':' + x.placeholder).join(' | '));
+check('form has cwd, model, and a yolo checkbox',
+  inputs.length === 3 && inputs[0].name === 'cwd' && inputs[1].name === 'model'
+  && inputs[2].name === 'yolo' && inputs[2].type === 'checkbox',
+  inputs.map((x) => x.tagName + ':' + x.name).join(' | '));
+check('yolo checkbox starts unticked for a new cwd', inputs[2].checked === false, String(inputs[2].checked));
+check('yolo label explains the rule', txt(top()).includes('yolo — skip permission prompts, deny rules still apply'),
+  txt(top()).replace(/\s+/g, ' ').slice(0, 120));
 inputs[0].value = '';
 btn('primary').fire('click');
 await tick(300);
@@ -353,6 +502,31 @@ await waitFor('layer closed', () => el('overlays').childElementCount === 0);
 check('dialog closed after create', el('overlays').childElementCount === 0);
 check('created session is current', await waitFor('selection', () => /^web-\d{3}$/.test(M.S.current) && M.S.current !== 'web-1'), M.S.current);
 check('cwd remembered', globalThis.localStorage.getItem('maki.cwd') === '/tmp/phone-ui');
+const createCall = lastCall(/\/api\/sessions$/, 'POST');
+check('unticked dialog create sends no yolo key',
+  !!createCall && !('yolo' in createCall.body)
+  && createCall.body.cwd === '/tmp/phone-ui' && createCall.body.prompt === 'first prompt',
+  JSON.stringify(createCall && createCall.body));
+check('yolo choice remembered for that cwd',
+  JSON.parse(globalThis.localStorage.getItem('maki.yolo'))['/tmp/phone-ui'] === false,
+  globalThis.localStorage.getItem('maki.yolo'));
+const probed = await probeBodies(() => store.api.create('/tmp/probe', '', '', false));
+check('unticked create sends no yolo key', !('yolo' in probed[0]), JSON.stringify(probed[0]));
+check('ticked create sends yolo true',
+  (await probeBodies(() => store.api.create('/tmp/probe', '', '', true)))[0].yolo === true);
+store.saveYolo('/tmp/other', false);
+check('yolo memory is kept per cwd',
+  store.yoloFor('/tmp/other') === false && store.yoloFor('/tmp/never-set') === undefined,
+  globalThis.localStorage.getItem('maki.yolo'));
+store.saveYolo('/tmp/phone-ui', true);
+el('fab').fire('click');
+await tick(200);
+check('reopened dialog ticks yolo for the known cwd',
+  top().querySelectorAll('input')[2].checked === true, String(top().querySelectorAll('input')[2].checked));
+top().querySelector('.icon').fire('click');
+await tick(150);
+check('reopened dialog closed without creating',
+  el('overlays').childElementCount === 0 && /^web-\d{3}$/.test(M.S.current), M.S.current);
 const dump = () => M.S.current + ' rows=' + tr.children.length + ' :: ' + tr.children.map((c) => txt(c).slice(0, 46)).join(' // ');
 check('first prompt shown', await waitFor('prompt', () => txt(tr).includes('first prompt')), dump());
 check('acp chunks streamed', await waitFor('chunks', () => txt(tr).includes('Reading the contract and the current renderer now.')), dump());
@@ -363,10 +537,38 @@ check('streaming row marked', has(tr, 'msg').some((m) => m.className.includes('s
 check('acp tool output shown', await waitFor('tool output', () => has(tr, 'card-body').some((b) => txt(b).includes('paintBody'))));
 check('permission asked after ~10s', await waitFor('permission', () => M.S.modals.size === 1, 14000), dump());
 check('modal scrolls long input', has(top(), 'out').length >= 1);
+check('web modal: three buttons', has(top(), 'btn').length === 3, has(top(), 'btn').map((b) => txt(b)).join('|'));
+check('web modal: Always allow is the primary', txt(btn('primary')) === 'Always allow', txt(btn('primary')));
+check('web modal: Allow once is offered too',
+  has(top(), 'btn').some((b) => txt(b) === 'Allow once'), has(top(), 'btn').map((b) => txt(b)).join('|'));
 btn('primary').fire('click');
 check('turn completed after allow', await waitFor('close', () => M.S.modals.size === 0), [...M.S.modals.keys()].join());
+const alwaysCall = lastCall(/\/api\/permissions\/acp\//);
+check('always allow posts allow_always',
+  !!alwaysCall && alwaysCall.body.decision === 'allow_always', JSON.stringify(alwaysCall && alwaysCall.body));
+check('allow toast names the choice',
+  has(el('toasts'), 'toast').some((t) => /Always allowed edit/.test(txt(t))), txt(has(el('toasts'), 'toast').at(-1)));
 check('usage footer for the turn', await waitFor('usage', () => has(tr, 'usage').length >= 1), dump());
 check('usage footer shape', /\d+(\.\d+)?k? in · .+ out · .+ · \$/.test(txt(has(tr, 'usage')[0])), txt(has(tr, 'usage')[0]));
+
+/* yolo create survives the mock: that session answers its prompts unasked */
+const yoloRes = await store.api.create('/tmp/yolo-dir', '', 'first prompt', true);
+const yid = yoloRes && yoloRes.session;
+check('ticked create reaches the wire with yolo true',
+  (lastCall(/\/api\/sessions$/, 'POST') || { body: {} }).body.yolo === true,
+  JSON.stringify((lastCall(/\/api\/sessions$/, 'POST') || {}).body));
+check('mock creates a yolo session', /^web-\d{3}$/.test(yid || ''), yid);
+let yoloWorked = false;
+check('yolo turn runs to its end with no dialog', await waitFor('yolo over', () => {
+  const s = M.S.sessions.find((x) => x.id === yid) || {};
+  if (s.status === 'working') yoloWorked = true;
+  return yoloWorked && s.status === 'idle';
+}), yid + ' ' + JSON.stringify(M.S.sessions.find((x) => x.id === yid)));
+check('no permission modal opened for the yolo session',
+  M.S.modals.size === 0 && el('overlays').childElementCount === 0, [...M.S.modals.keys()].join());
+await M.selectSession(yid);
+await tick(500);
+check('the yolo session says it answered itself', txt(tr).includes('answered itself'), txt(tr).slice(-90));
 
 /* cancel then kill a web session */
 el('cancel-btn').fire('click');
@@ -395,7 +597,8 @@ check('status event patches the rail in place', txt(list).includes('Renamed by e
 const rowsBefore = [...list.children];
 mock.emit('sessions', {});
 await tick(800);
-check('sessions event keeps row count', list.children.length === 4, list.children.length);
+// web-1 + live-1 + sto-1 + the two sessions this run created (one plain, one yolo)
+check('sessions event keeps row count', list.children.length === 5, list.children.length);
 check('sessions event reuses rows', rowsBefore.every((n, i) => list.children[i] === n));
 check('no leaked layers', el('overlays').childElementCount === 0, txt(el('overlays')).slice(0, 60));
 const rowsNow = M.S.messages.length;
@@ -416,6 +619,13 @@ check('narrow: close collapses it', document.body.dataset.rail === 'closed' && e
 el('rail-toggle').fire('click');
 el('scrim').fire('click');
 check('narrow: scrim dismisses', document.body.dataset.rail === 'closed');
+el('tasks-head').fire('click');
+check('narrow: sub-agents collapses on its own, the rail stays shut',
+  document.body.dataset.rail === 'closed' && el('tasks-body').hidden === true);
+el('tasks-head').fire('click');
+check('narrow: sub-agents expands again', el('tasks-body').hidden === false);
+check('narrow: the rows are still there after expanding',
+  await waitFor('rows after expand', () => trows().length >= 1), txt(el('tasks-body')).slice(0, 60));
 
 await tick(120);
 check('transcript still rendered after rail work', tr.children.length >= 2, tr.children.length + ' rows, current=' + M.S.current);

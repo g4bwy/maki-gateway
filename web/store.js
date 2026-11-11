@@ -29,6 +29,26 @@ export const saveCwd = (cwd) => cwd && LS.set('cwd', cwd);
 export const lastSession = () => LS.get('session', '');
 export const saveSession = (id) => id && LS.set('session', id);
 
+const YOLO_KEY = 'yolo';
+
+/** cwd -> remembered yolo choice. Damaged JSON reads as "nothing remembered". */
+const yoloMap = () => {
+  let v;
+  try { v = JSON.parse(LS.get(YOLO_KEY, '{}')); } catch { return {}; }
+  return v && typeof v === 'object' ? v : {};
+};
+
+/** Remembered yolo choice for a cwd: true, false, or undefined when never set. */
+export function yoloFor(cwd) {
+  const v = cwd ? yoloMap()[cwd] : undefined;
+  return v === true || v === false ? v : undefined;
+}
+
+export function saveYolo(cwd, on) {
+  if (!cwd) return;
+  LS.set(YOLO_KEY, JSON.stringify({ ...yoloMap(), [cwd]: !!on }));
+}
+
 /** Append the auth token when present. Loopback MVP: token comes from ?token=. */
 export function withToken(path) {
   if (!S.token) return path;
@@ -71,12 +91,14 @@ export const api = {
   setTitle: (id, title) => req('POST', `/api/sessions/${encodeURIComponent(id)}/title`, { title }),
   kill: (id) => req('DELETE', `/api/sessions/${encodeURIComponent(id)}`),
   plan: (id) => req('GET', '/api/plan/' + encodeURIComponent(id)),
+  tasks: (id) => req('GET', `/api/sessions/${encodeURIComponent(id)}/tasks`),
   search: (q) => req('GET', '/api/search?q=' + encodeURIComponent(q)),
   analytics: (days = 30) => req('GET', '/api/analytics?days=' + days),
-  create(cwd, model, prompt) {
+  create(cwd, model, prompt, yolo) {
     const body = { cwd };
     if (model) body.model = model;
     if (prompt) body.prompt = prompt;
+    if (yolo) body.yolo = true;
     return req('POST', '/api/sessions', body);
   },
   permission(engine, requestId, decision, guidance) {

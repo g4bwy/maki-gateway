@@ -10,7 +10,8 @@
  * source. Sessions of kind `web` fold ACP `session/update` passthrough in place
  * (acp.js); sessions of kind `live` only report `dirty`, so a debounced 500 ms
  * refetch pulls the whole tail. `sessions`, `status`, `notice`, `exit` and
- * `permission` events drive the rail, the toasts, and the decision modals.
+ * `permission` events drive the rail, the toasts, and the decision modals. A
+ * `tasks` event refetches the sub-agents panel the same debounced way.
  *
  * Development without a gateway: `/?mock=1` loads mock.js. Real paths stay real.
  */
@@ -19,7 +20,7 @@ import { renderTranscript, el } from './render.js';
 import { applyUpdate, closeStream } from './acp.js';
 import {
   toast, askText, askYes, popLayer, newChat, searchOverlay, analyticsView,
-  planDrawer, permissionModal, permissionGone,
+  planDrawer, permissionModal, permissionGone, taskRows,
 } from './ui.js';
 
 const MAX_GROW = 180;
@@ -34,6 +35,8 @@ const drafts = new Map();
 const dirty = new Map();
 let events = null;
 let queued = false;
+let tasksOpen = true;
+let tasksReq = 0;
 
 /** Short text a thumb can read in a toast. */
 const errText = (e, fallback) => (e instanceof ApiError
@@ -76,10 +79,16 @@ async function loadMessages() {
   }
 }
 
+/** Refetch at most once per DIRTY_MS window per key. */
+function debounce(key, run) {
+  if (dirty.has(key)) return;
+  dirty.set(key, setTimeout(() => { dirty.delete(key); run(); }, DIRTY_MS));
+}
+
 /** A live session changed: refetch its tail once, after the stream settles. */
 function scheduleMessages(id) {
-  if (id !== S.current || dirty.has(id)) return;
-  dirty.set(id, setTimeout(() => { dirty.delete(id); loadMessages(); }, DIRTY_MS));
+  if (id !== S.current) return;
+  debounce('m' + id, loadMessages);
 }
 
 export async function selectSession(id) {
@@ -88,7 +97,10 @@ export async function selectSession(id) {
   if (changed && S.current) drafts.set(S.current, els.input.value);
   S.current = id;
   saveSession(id);
-  if (!changed) return loadMessages();
+  if (!changed) {
+    loadTasks();
+    return loadMessages();
+  }
   S.messages = [];
   S.pending = [];
   els.transcript.replaceChildren();
@@ -97,6 +109,7 @@ export async function selectSession(id) {
   if (narrow()) rail(false);
   paintTopbar();
   paintRail();
+  loadTasks();
   await loadMessages();
 }
 
@@ -192,7 +205,59 @@ function paintTopbar() {
   els.mode.className = 'chip mode m-' + S.mode;
   els.plan.hidden = !live;
   els.kill.hidden = !web;
+  paintTasksPanel();
   paintComposer();
+}
+
+/* -------------------------------------------------------------- sub-agents */
+
+/** The panel belongs to live rows only: the gateway answers 501 for the rest. */
+function paintTasksPanel() {
+  const show = (session() || {}).kind === 'live';
+  els.tasks.hidden = !show;
+  if (show) return;
+  els.tasksCount.textContent = '';
+  els.tasksBody.dataset.for = '';
+  els.tasksBody.replaceChildren();
+}
+
+function setTasksOpen(open) {
+  tasksOpen = open;
+  els.tasksBody.hidden = !open;
+  els.tasksHead.setAttribute('aria-expanded', String(open));
+}
+
+function paintTasks(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  els.tasksCount.textContent = String(list.length);
+  els.tasksBody.replaceChildren(...taskRows(list));
+}
+
+async function loadTasks() {
+  const id = S.current;
+  const s = session(id);
+  if (!s || s.kind !== 'live') return;
+  // Rows belong to the session they were read for: drop another tab's set, then keep
+  // what this tab has while the refresh is in flight, so the panel does not blink.
+  if (els.tasksBody.dataset.for !== id) els.tasksBody.replaceChildren();
+  els.tasksBody.dataset.for = id;
+  if (!els.tasksBody.children.length) els.tasksBody.replaceChildren(el('p', 'dim', 'Loading…'));
+  const mine = ++tasksReq;
+  try {
+    const r = await api.tasks(id);
+    if (mine === tasksReq && id === S.current) paintTasks(r && r.tasks);
+  } catch (e) {
+    if (mine !== tasksReq || id !== S.current) return;
+    els.tasksBody.replaceChildren(el('p', 'dim', e instanceof ApiError && e.status === 501
+      ? 'This gateway does not report sub-agents.'
+      : 'Could not load sub-agents: ' + e.message));
+  }
+}
+
+/** Tasks changed: refetch once, after the stream settles. */
+function scheduleTasks(id) {
+  if (id !== S.current) return;
+  debounce('t' + id, loadTasks);
 }
 
 function paintComposer() {
@@ -326,7 +391,10 @@ async function resync() {
     setOffline(false);
   } catch { /* the banner clears when EventSource recovers */ }
   await loadSessions();
-  if (S.current) await loadMessages();
+  if (S.current) {
+    loadTasks();
+    await loadMessages();
+  }
 }
 
 /** One SSE envelope. Shapes: CONTRACTS section 2. */
@@ -341,6 +409,9 @@ function onEvent(ev) {
     }
     case 'dirty':
       scheduleMessages(ev.session);
+      return;
+    case 'tasks':
+      scheduleTasks(ev.session);
       return;
     case 'sessions':
       loadSessions();
@@ -392,8 +463,11 @@ function boot() {
     mode: 'mode-btn', plan: 'plan-btn', search: 'search-btn', stats: 'stats-btn', kill: 'kill-btn',
     offline: 'offline', retry: 'retry-btn', transcript: 'transcript', ro: 'readonly',
     input: 'input', cancel: 'cancel-btn', send: 'send-btn', fab: 'fab',
+    tasks: 'tasks', tasksHead: 'tasks-head', tasksBody: 'tasks-body', tasksCount: 'tasks-count',
   };
   for (const [k, id] of Object.entries(ids)) els[k] = $(id);
+  tasksOpen = !narrow();
+  setTasksOpen(tasksOpen);
   rail(!narrow());
   $('rail-toggle').addEventListener('click', () => rail(document.body.dataset.rail !== 'open'));
   $('rail-close').addEventListener('click', () => rail(false));
@@ -401,6 +475,7 @@ function boot() {
   els.title.addEventListener('click', rename);
   els.mode.addEventListener('click', () => setMode(S.mode === 'build' ? 'plan' : 'build'));
   els.plan.addEventListener('click', () => session() && planDrawer(S.current));
+  els.tasksHead.addEventListener('click', () => setTasksOpen(!tasksOpen));
   els.search.addEventListener('click', () => searchOverlay(selectSession));
   els.stats.addEventListener('click', () => analyticsView());
   els.kill.addEventListener('click', kill);
@@ -442,6 +517,7 @@ function start() {
     m.install();
     globalThis.maki.mock = {
       emit: m.emit, permission: m.fakePermission, expire: m.expire, drop: m.dropStream, quiet: m.quiet,
+      tasks: m.tasksFor,
     };
     boot();
   }, () => boot());

@@ -3,11 +3,18 @@
  * plan drawer, search overlay, analytics view, new chat form.
  * Nothing here knows about SSE or state sync; app.js calls these.
  */
-import { S, api, ApiError, json, ago, money, num, lastCwd, saveCwd } from './store.js';
+import { S, api, ApiError, json, ago, money, num, lastCwd, saveCwd, yoloFor, saveYolo, session } from './store.js';
 import { el, markdownEl, codeText } from './render.js';
 
 const TOAST_MS = 4200;
 const SEARCH_MS = 300;
+const YOLO_LABEL = 'yolo — skip permission prompts, deny rules still apply';
+/** Task fields worth a glance. Anything else a row carries stays in the JSON fold. */
+const TASK_KEYS = ['name', 'label', 'title', 'tool', 'model', 'plugin', 'cost', 'session', 'id'];
+/** Task statuses the rail dot styles already know, plus the terminal ones. */
+const TASK_STATES = ['working', 'idle', 'done', 'error', 'cancelled'];
+/** Toast verb per decision. */
+const ANSWERED = { allow: 'Allowed', allow_always: 'Always allowed', deny: 'Denied' };
 const stack = [];
 
 const host = (id) => document.getElementById(id);
@@ -148,10 +155,20 @@ export function newChat(onCreated) {
   const cwd = textInput('cwd', lastCwd(), '/path/to/project');
   const model = textInput('model', '', 'provider/model (optional)');
   const prompt = areaInput('prompt', '', 'First message (optional)');
+  const yolo = el('input', '');
+  yolo.name = 'yolo';
+  yolo.type = 'checkbox';
+  yolo.checked = yoloFor(cwd.value.trim()) === true;
+  cwd.addEventListener('change', () => {
+    const remembered = yoloFor(cwd.value.trim());
+    if (remembered !== undefined) yolo.checked = remembered;
+  });
+  const check = el('label', 'field check');
+  check.append(yolo, el('span', '', YOLO_LABEL));
   const err = el('p', 'lerr');
   err.hidden = true;
   const form = el('form', 'form');
-  form.append(field('Working directory', cwd), field('Model', model), field('First prompt', prompt), err);
+  form.append(field('Working directory', cwd), field('Model', model), check, field('First prompt', prompt), err);
   const actions = el('div', 'actions');
   const l = layer('sheet', 'New chat', [form, actions]);
   const go = button('Start', 'primary', submit);
@@ -168,8 +185,9 @@ export function newChat(onCreated) {
     go.disabled = true;
     go.textContent = 'Starting…';
     try {
-      const r = await api.create(dir, model.value.trim(), prompt.value.trim());
+      const r = await api.create(dir, model.value.trim(), prompt.value.trim(), yolo.checked);
       saveCwd(dir);
+      saveYolo(dir, yolo.checked);
       l.close();
       if (r && r.session) onCreated(r.session);
     } catch (ex) {
@@ -327,7 +345,7 @@ export function permissionModal(ev) {
     for (const b of btns) b.disabled = true;
     try {
       await api.permission(ev.engine, ev.request_id, decision, note.value.trim());
-      toast(decision === 'allow' ? 'Allowed ' + (ev.tool || 'tool') : 'Denied ' + (ev.tool || 'tool'), 'ok');
+      toast((ANSWERED[decision] || 'Answered') + ' ' + (ev.tool || 'tool'), 'ok');
       l.close();
     } catch (e) {
       for (const b of btns) b.disabled = false;
@@ -335,9 +353,80 @@ export function permissionModal(ev) {
       if (e instanceof ApiError && e.status === 404) l.close();
     }
   };
-  actions.append(button('Deny', 'danger', () => respond('deny')), button('Allow', 'primary', () => respond('allow')));
+  // Only a web session can take a rule that outlives the prompt: the attach side
+  // answers allow_always as allow, so the live row hides a button that does nothing.
+  const web = (session(ev.session) || {}).kind === 'web';
+  actions.append(
+    button('Deny', 'danger', () => respond('deny')),
+    button('Allow once', web ? '' : 'primary', () => respond('allow')),
+  );
+  if (web) actions.append(button('Always allow', 'primary', () => respond('allow_always')));
   S.modals.set(key, l);
   return l;
+}
+
+/** Collapsible JSON of the task fields a row cannot show as text. */
+function extraFold(value) {
+  const box = el('div', 'fold extra');
+  const head = el('button', 'fold-head', 'extra');
+  head.type = 'button';
+  head.setAttribute('aria-expanded', 'false');
+  const body = el('div', 'fold-body');
+  body.hidden = true;
+  body.append(codeText(json(value)));
+  box.append(head, body);
+  head.addEventListener('click', () => {
+    body.hidden = !body.hidden;
+    head.setAttribute('aria-expanded', String(!body.hidden));
+  });
+  return box;
+}
+
+const fieldPair = (k, v) => {
+  const p = el('span', 'tk');
+  p.append(el('b', '', k), el('span', '', v));
+  return p;
+};
+
+/** One task value as text. Times read relative, cost keeps its currency. */
+function fieldValue(k, v) {
+  if (k === 'cost' && typeof v === 'number') return money(v);
+  if (/_at$/.test(k) && typeof v === 'number') return ago(v) || String(v);
+  return String(v);
+}
+
+/**
+ * One task row: status dot, then the scalar fields it carries (known names first),
+ * then anything structured behind a JSON fold. Nothing is assumed required, so a
+ * row with only an id renders, and so does a row that is not an object at all.
+ */
+export function taskRow(t) {
+  const row = el('div', 'task');
+  const obj = t && typeof t === 'object' && !Array.isArray(t) ? t : null;
+  const status = obj && obj.status != null ? String(obj.status) : '';
+  const dot = el('span', 'st ' + (TASK_STATES.includes(status) ? status : 'idle'));
+  dot.setAttribute('title', status || 'unknown');
+  row.append(dot);
+  if (!obj) {
+    row.append(el('span', 'tk', json(t)));
+    return row;
+  }
+  const keys = Object.keys(obj);
+  const extra = {};
+  for (const k of TASK_KEYS.filter((x) => keys.includes(x)).concat(keys.filter((x) => !TASK_KEYS.includes(x)))) {
+    const v = obj[k];
+    if (k === 'status' || v == null || v === false) continue;
+    if (typeof v === 'object') { extra[k] = v; continue; }
+    row.append(fieldPair(k, v === true ? 'yes' : fieldValue(k, v)));
+  }
+  if (Object.keys(extra).length) row.append(extraFold(extra));
+  return row;
+}
+
+/** Rows for the sub-agents panel. Empty or malformed payloads read as "none running". */
+export function taskRows(tasks) {
+  if (!Array.isArray(tasks) || !tasks.length) return [el('p', 'dim', 'none running')];
+  return tasks.map(taskRow);
 }
 
 /** Drop the modal that a permission_cancel refers to. */
