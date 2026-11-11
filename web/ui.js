@@ -9,7 +9,7 @@ import { el, markdownEl, codeText, renderMessages } from './render.js';
 const TOAST_MS = 4200;
 const SEARCH_MS = 300;
 /** Exact wording the follow feature must show once per session switch. */
-const FOLLOW_CAVEAT = 'The terminal now sends typed input to this task';
+const FOLLOW_CAVEAT = 'The terminal keyboard now types into this task; browser prompts still go to the main chat.';
 const FOLLOWED_LABEL = 'followed in terminal';
 const RUN_BANNER = 'The transcript is written when the run ends. You can follow it in the terminal meanwhile.';
 const NO_TRANSCRIPT = 'No transcript records.';

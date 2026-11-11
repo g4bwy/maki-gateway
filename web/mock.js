@@ -30,6 +30,11 @@ const sessions = [
 const DECISIONS = new Set(['allow', 'allow_always', 'deny']);
 const TASKS_LATER = 300;
 const FOCUS_LATER = 250;
+// The two focus refusals the gateway itself writes: its own sentence for a kind
+// with no terminal, and the plugin sentence it forwards under the 501 sentinel
+// that refusal carries (CONTRACTS 2 and 3).
+const FOLLOW_LIVE_TEXT = 'follow is a live-session action';
+const NO_UI_TEXT = 'no interactive UI attached';
 
 /**
  * Fake maki.task.list rows per live session. Field names and shapes follow the
@@ -55,7 +60,7 @@ const longOutput = 'GET /api/sessions 200 ok\n' + '  120 lines of file output\n'
 /**
  * Task transcripts, per session then task id. The working row t-7 has no entry:
  * maki writes a sub transcript only when the run ends, so its fetch answers [].
- * A live session without a `task_focus` plugin answers focus with the NO_UI 404.
+ * A live session without a `task_focus` plugin answers focus with NO_UI 501.
  */
 const taskTranscripts = {
   'live-1': {
@@ -330,14 +335,17 @@ function taskMessagesOf(id, tid) {
 }
 
 /**
- * Follow a task in the terminal. Live rows only; the plugin error strings are
- * kept verbatim, and success raises the task_focus event the terminal follows with.
+ * Follow a task in the terminal, status for status with the gateway. Only a live
+ * row has a screen to move (501 followLiveText), and a refusal the terminal wrote
+ * keeps its own words: 501 for a maki with no interactive UI behind its plugin,
+ * 404 for an id that is not one of this tab's chats. Success raises the
+ * task_focus event the browser moves its marker on.
  */
 function focusTask(id, tid) {
   const s = current(id);
   if (!s) return http(404, 'unknown session ' + id);
-  if (s.kind !== 'live') return http(501, 'focus is only available for live sessions');
-  if (noUiPlugin.has(id)) return http(404, 'no interactive UI attached');
+  if (s.kind !== 'live') return http(501, FOLLOW_LIVE_TEXT);
+  if (noUiPlugin.has(id)) return http(501, NO_UI_TEXT);
   const rows = tasks[id] || [];
   if (tid !== 'main' && !rows.some((t) => t && t.id === tid)) return http(404, 'no task with id ' + tid);
   setTimeout(() => emit('task_focus', { session: id, id: tid }), FOCUS_LATER);

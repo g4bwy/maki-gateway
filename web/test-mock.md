@@ -10,7 +10,7 @@ Automated, no browser needed. It drives the real modules through a DOM shim and
 prints one line per check:
 
 ```
-cd maki-gateway/web && node test-mock.mjs     # 246 checks, then ALL CHECKS PASSED
+cd maki-gateway/web && node test-mock.mjs     # 247 checks, then ALL CHECKS PASSED
 ```
 
 By hand, in a browser:
@@ -42,8 +42,10 @@ Creating a chat adds a new `web-*` session. `live-1` reports two fake sub-agent 
 working, one done); every other kind answers 501 for the task list, like the gateway does.
 The working task has no stored transcript, so its messages endpoint answers an empty list. The
 done task has a short fake transcript (thinking, text, one failed tool result). Its focus
-endpoint answers like the frozen task contract: 200 for a live row, 501 for web and stored,
-404 with the plugin error text otherwise, and a `task_focus` event after a successful follow.
+endpoint answers status for status with the gateway: 200 for a live row, 501
+"follow is a live-session action" for web and stored, 501 "no interactive UI attached" for a
+session marked old-plugin, 404 "no task with id …" for a row that tab does not have, and a
+`task_focus` event after a successful follow.
 A chat created with the yolo box ticked answers its own permission prompts, so no dialog
 opens for it. `POST /api/sessions/{id}/yolo` flips the flag on a web row and raises a
 `sessions` event. It replies 409 while that row is mid-prompt, so the working `web-1`
@@ -190,9 +192,10 @@ always rejects a toggle, and it replies 501 for the live and stored rows.
     `maki.mock.taskTranscript('live-1', 't-8', [])` and a reload of the sheet.
 51. Tap FOLLOW in a live sheet header. The request goes to
     `POST /api/sessions/live-1/tasks/{id}/focus`. On success the row and the sheet header get a
-    small `followed in terminal` chip, and the toast reads exactly: "The terminal now sends
-    typed input to this task". That wording is the steering caveat: from that point the person
-    at the terminal types into that task. The toast appears once per session: follow a second
+    small `followed in terminal` chip, and the toast reads exactly: "The terminal keyboard now
+    types into this task; browser prompts still go to the main chat." That wording is the
+    steering caveat: only the keys typed at the terminal follow the task, and the browser keeps
+    sending its prompts to the main chat. The toast appears once per session: follow a second
     task in the same session and no new toast comes. Switch to another session and back, and
     the next follow toasts again. The sheet fetches the transcript once more about 2 s after a
     successful follow.
@@ -205,9 +208,10 @@ always rejects a toggle, and it replies 501 for the live and stored rows.
     clears every chip. A `task_focus` event with no id, or for another session, changes nothing
     on screen.
 54. A `web` or `stored` session has no rows, so a FOLLOW button never shows there. Run
-    `maki.api.taskFocus('web-1', 't-8')`: 501. Run `maki.api.taskFocus('live-1', 'nope')`:
-    404 with "no task with id nope". Run `maki.mock.oldPlugin('live-1')` and follow again:
-    404 with "no interactive UI attached", the verbatim plugin error.
+    `maki.api.taskFocus('web-1', 't-8')` and the same for `sto-1`: 501 with "follow is a
+    live-session action". Run `maki.api.taskFocus('live-1', 'nope')`: 404 with "no task with id
+    nope". Run `maki.mock.oldPlugin('live-1')` and follow again: 501 with "no interactive UI
+    attached", the verbatim plugin error under the status its sentinel picks.
 
 ## Notes for the real gateway
 
@@ -220,9 +224,10 @@ always rejects a toggle, and it replies 501 for the live and stored rows.
 - The task sheet uses the frozen task-detail contract. `GET .../tasks/{id}/messages` answers
   200 with an empty list while a task runs, because maki writes sub transcripts only at run
   end. It answers 404 only for an unknown session. `POST .../tasks/{id}/focus` answers
-  `{"ok":true}` for a live row, 501 for web and stored, and 404 with the plugin error text
-  verbatim. The browser expects a `task_focus` SSE event with fields `session` and `id`
-  whenever the followed task in the terminal changes, `id` `"main"` included.
+  `{"ok":true}` for a live row, 501 with its own sentence for web and stored, and the refusal
+  the terminal wrote with the status that refusal maps to: 501 "no interactive UI attached"
+  and 404 "no task with id …". The browser expects a `task_focus` SSE event with fields
+  `session` and `id` whenever the followed task in the terminal changes, `id` `"main"` included.
 - Unknown message, block, or ACP shapes render as raw JSON rather than dropping text.
 - The renderer trusts only `http:`, `https:`, and `mailto:` links.
 - No endpoint reports the current mode, so the build/plan chip label is optimistic. It

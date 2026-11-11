@@ -393,7 +393,7 @@ M.selectSession('web-1');
 await tick(400);
 
 /* task detail sheet: rows open a sheet, transcript shares the chat renderers, follow works */
-const FOLLOW_CAVEAT = 'The terminal now sends typed input to this task';
+const FOLLOW_CAVEAT = 'The terminal keyboard now types into this task; browser prompts still go to the main chat.';
 const RUN_BANNER = 'The transcript is written when the run ends. You can follow it in the terminal meanwhile.';
 const tsec = Math.floor(Date.now() / 1000);
 const detailRows = [
@@ -519,14 +519,18 @@ check('task messages for a web session answer empty, not 404', !!tmWeb && Array.
 const tm404 = await store.api.taskMessages('nope-9', 't-8').then(() => null, (e) => e);
 check('task messages 404 only for an unknown session', !!tm404 && tm404.status === 404, tm404 && tm404.status);
 const tfWeb = await store.api.taskFocus('web-1', 't-8').then(() => null, (e) => e);
-check('focus on a web session answers 501', !!tfWeb && tfWeb.status === 501, tfWeb && tfWeb.status);
+check('focus on a web session answers 501 with the gateway sentence', !!tfWeb && tfWeb.status === 501
+  && tfWeb.message === 'follow is a live-session action', tfWeb && [tfWeb.status, tfWeb.message]);
+const tfStored = await store.api.taskFocus('sto-1', 't-8').then(() => null, (e) => e);
+check('focus on a stored session answers the same 501', !!tfStored && tfStored.status === 501
+  && tfStored.message === 'follow is a live-session action', tfStored && [tfStored.status, tfStored.message]);
 const tfNoTask = await store.api.taskFocus('live-1', 'nope-9').then(() => null, (e) => e);
 check('focus on an unknown task 404s with the plugin wording', !!tfNoTask && tfNoTask.status === 404
   && tfNoTask.message === 'no task with id nope-9', tfNoTask && tfNoTask.message);
 mock.oldPlugin('live-1');
 const tfOld = await store.api.taskFocus('live-1', 't-8').then(() => null, (e) => e);
-check('a TUI without the updated plugin 404s verbatim', !!tfOld && tfOld.status === 404
-  && tfOld.message === 'no interactive UI attached', tfOld && tfOld.message);
+check('a TUI without the updated plugin 501s with its own words', !!tfOld && tfOld.status === 501
+  && tfOld.message === 'no interactive UI attached', tfOld && [tfOld.status, tfOld.message]);
 mock.oldPlugin('live-1', false);
 const tfMain = await store.api.taskFocus('live-1', 'main');
 check('following the main chat succeeds', !!tfMain && tfMain.ok === true);
