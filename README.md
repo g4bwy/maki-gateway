@@ -24,7 +24,8 @@ pass the path: `-web /path/to/maki-gateway/web`. When neither the `-web` value n
 directory beside the binary holds `index.html`, the gateway says so and exits instead of serving a
 page of 404s.
 
-Open http://127.0.0.1:8765. Installing the attach plugin: see `lua/gateway/README.md`.
+Open http://127.0.0.1:8765. Installing the attach plugin is one line in
+`~/.config/maki/init.lua`, and `lua/gateway/README.md` gives it.
 
 `MAKI_GATEWAY_TOKEN` gates non-loopback binds only. A loopback bind (127.0.0.1, ::1, localhost)
 serves without auth even when that variable is set, so port-forward with care.

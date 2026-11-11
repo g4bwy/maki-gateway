@@ -12,57 +12,59 @@ any tab comes back out as an event line.
 
 ## Install
 
-The plugin is one directory. Put it in your maki config dir, load it, and grant the
-permissions.
+Add one line to `~/.config/maki/init.lua`, then restart maki:
 
-1. Copy or link the directory:
+```lua
+maki.pack.add({ "file:///path/to/maki-gateway" })   -- or the pushed https URL
+```
 
-   ```bash
-   mkdir -p ~/.config/maki/lua
-   cp -r lua/gateway ~/.config/maki/lua/gateway
-   # or keep it in a checkout and link it:
-   ln -s /path/to/maki-gateway/lua/gateway ~/.config/maki/lua/gateway
-   ```
+Maki clones the repository, asks you twice at startup, and loads the plugin:
 
-2. Load it. Add one line to `~/.config/maki/init.lua`, creating the file if you have none:
+```
+Install these packages?
+  maki-gateway from file:///path/to/maki-gateway
+Allow package maki-gateway these permissions: run, fs_read, fs_write, env,
+agent, session_read, session_write, session_settings?
+```
 
-   ```lua
-   require("gateway")
-   ```
+Answer `y` to both. The second answer is what grants the permissions in
+`plugin.toml`: a fetched pack gets the manifest request cut down by what you
+approved, so nothing runs before you say yes. Approvals are stored, so the
+prompts come back only when the pack asks for something new or you clear them.
 
-   Nothing under `lua/` loads on its own. `require("gateway")` finds `lua/gateway/init.lua`.
+`maki.pack.add` works only from the global `~/.config/maki/init.lua`, and only at
+startup. Both prompts need a real terminal, so run `maki` yourself in one; under
+`maki -p` the pack is skipped with a note that installation needs confirmation.
 
-3. Grant the permissions. Maki reads grants for your own Lua from the manifest in the
-   config dir that loads it, so the keys in `plugin.toml` next to this README belong in
-   `~/.config/maki/plugin.toml`. Merge them into a file you already have, or copy this one
-   in place when you have none:
+The pack is the whole repository. Maki reads only `plugin.toml`, `plugin/`, and
+`lua/` from it, so the Go source, the web files, and the docs cost nothing but
+clone time. `plugin/gateway.lua` is the entry point maki auto-runs, and it is one
+`require("gateway")`, which finds `lua/gateway/init.lua`. The comments in
+`plugin.toml` say which call needs which grant. The checkout lands under
+`~/.local/share/maki/site/pack/core/maki-gateway/<rev>/`, and your answer to the
+second prompt is stored in `~/.local/share/maki/site/pack-approvals.json`.
 
-   ```toml
-   [permissions]
-   run = true
-   fs_read = true
-   fs_write = true
-   env = true
-   agent = true
-   session_read = true
-   session_write = true
-   session_settings = true
-   ```
+To pin a release, or to rename the directory it installs under, pass a table
+instead of a string: `maki.pack.add({ { src = "...", version = "v1.0.0", name =
+"maki-gateway" } })`.
 
-   `run` opens the socket. `agent` sends prompts to the model. `session_read` reads
-   transcripts and event content. `session_write` creates sessions and pops the queue.
-   `session_settings` changes mode and title. A call without its grant fails with
-   `permission denied: '<name>' not granted for this plugin`, and the plugin logs it.
+After the restart, or after `/reload` in a session that is already up, the plugin
+logs one line when the socket is open:
 
-4. Start maki, or run `/reload` in a session that is already up. The plugin logs one line
-   when the socket is open:
+```bash
+grep 'control socket' ~/.local/logs/maki/*.log
+```
 
-   ```bash
-   grep 'control socket' ~/.local/logs/maki/*.log
-   ```
-
-For a project-only install use `<project>/.maki/` in place of `~/.config/maki/` in every
-step, and trust that folder so its plugins load.
+Power users who would rather not have maki manage a checkout can copy this
+directory to `~/.config/maki/lua/gateway`, add `require("gateway")` to
+`~/.config/maki/init.lua`, and copy the `[permissions]` table from `plugin.toml`
+into `~/.config/maki/plugin.toml`. Maki reads grants for a hand-placed plugin
+from the manifest of the config dir that loads it, and merging into a manifest you
+already have keeps your other grants. For a project-only install use
+`<project>/.maki/` in place of `~/.config/maki/` in every step, and trust that
+folder so its plugins load. With no manifest at all every gated call is denied. A
+call without its grant fails with `permission denied: '<name>' not granted for
+this plugin`, and the plugin logs it.
 
 ## Socket path
 

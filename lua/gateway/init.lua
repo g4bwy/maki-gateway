@@ -6,10 +6,11 @@
 -- maki-gateway/docs/CONTRACTS.md section 1, and this plugin is the maki side of
 -- it. Nothing here talks to a browser or to the model.
 --
--- Install: copy this directory to ~/.config/maki/lua/gateway, add
--- `require("gateway")` to ~/.config/maki/init.lua, and grant the permissions in
--- plugin.toml to ~/.config/maki/plugin.toml. README.md covers it, including the
--- MAKI_GATEWAY_SOCK override and how to try the socket with socat.
+-- Install: add `maki.pack.add({ "https://host/maki-gateway" })` to
+-- ~/.config/maki/init.lua and restart maki. The pack manifest is the plugin.toml
+-- at the repository root, and plugin/gateway.lua is the entry point that runs
+-- this module. README.md covers it, including the MAKI_GATEWAY_SOCK override and
+-- how to try the socket with socat.
 
 local conns = require("gateway.conns")
 local ops = require("gateway.ops")

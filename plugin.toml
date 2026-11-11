@@ -1,0 +1,33 @@
+# Manifest of the maki pack. Maki reads this one file at the pack root: it is
+# the single source of truth for what the gateway plugin asks for.
+#
+# Only three things are recognized here: the `[permissions]` table (booleans),
+# the top-level `net_hosts` and `providers` keys, and `min_maki_version`. There
+# is no name, version, or entry key. Every `plugin/*.lua` at the pack root runs
+# on load, and modules resolve from `lua/<name>/init.lua`.
+#
+# For a fetched pack the grants are this list cut down by what the user approved
+# at startup, so `true` here is a request, not a right. With no manifest at all
+# every gated call is denied.
+
+# The plugin needs the maki Lua APIs added around 0.7.1. An older maki skips the
+# pack with a warning instead of loading half of it.
+min_maki_version = "0.7.1"
+
+[permissions]
+# listen_unix, and the chmod helper that keeps the socket owner-only.
+run = true
+# state dir lookups, /proc/self/stat for the pid, maki.uv.cwd for hello.
+fs_read = true
+# mkdir -p and the removal of a stale socket file before bind.
+fs_write = true
+# MAKI_GATEWAY_SOCK and XDG_STATE_HOME.
+env = true
+# maki.session.prompt, and maki.session.new with a prompt.
+agent = true
+# maki.session.messages, maki.plan.read, and the content fields of events.
+session_read = true
+# maki.session.new, notify, and the pop_queue action.
+session_write = true
+# maki.session.set_mode and maki.session.set_title.
+session_settings = true

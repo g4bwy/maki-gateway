@@ -184,4 +184,6 @@ The attach engine fans requests to the right plugin by `plugin_pid`. The store e
 - `maki acp` is fakeable: tests use `-maki <path>` pointing at a script/binary that speaks the
   subset in appendix A of `docs/ACP_MIN.md` (owned by the acpengine package).
 - The socket protocol is fakeable with a Go test listener per section 1.
-- Never hand-edit `maki.d.luau` or maki sources. The plugin lives in `lua/gateway/`.
+- Never hand-edit `maki.d.luau` or maki sources. The plugin is a maki pack: the
+  manifest is the `plugin.toml` at the repository root, `plugin/gateway.lua` is the
+  entry point maki auto-runs, and the module files stay in `lua/gateway/`.
