@@ -16,6 +16,10 @@ type planner interface {
 	Plan(id string) (json.RawMessage, error)
 }
 
+type tasker interface {
+	Tasks(id string) (json.RawMessage, error)
+}
+
 type searcher interface {
 	Search(q string, limit int) ([]SearchHit, error)
 }
@@ -38,6 +42,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/sessions/{id}/cancel", s.handleCancel)
 	m.HandleFunc("POST /api/sessions/{id}/mode", s.handleMode)
 	m.HandleFunc("POST /api/sessions/{id}/title", s.handleTitle)
+	m.HandleFunc("GET /api/sessions/{id}/tasks", s.handleTasks)
 	m.HandleFunc("POST /api/permissions/{engine}/{request_id}", s.handlePermission)
 	m.HandleFunc("GET /api/plan/{id}", s.handlePlan)
 	m.HandleFunc("GET /api/search", s.handleSearch)
@@ -106,6 +111,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Cwd    string `json:"cwd"`
 		Model  string `json:"model"`
 		Prompt string `json:"prompt"`
+		Yolo   bool   `json:"yolo"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
@@ -122,7 +128,12 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "no acp engine")
 		return
 	}
-	id, err := eng.Create(cwd, body.Model, body.Prompt)
+	id, err := eng.Create(model.CreateRequest{
+		Cwd:    cwd,
+		Model:  body.Model,
+		Prompt: body.Prompt,
+		Yolo:   body.Yolo,
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -339,6 +350,11 @@ func (s *Server) handlePermission(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &body) {
 		return
 	}
+	// Checked here so a typo costs a 400 rather than a dialog that stays parked.
+	if !model.IsDecision(body.Decision) {
+		writeErr(w, http.StatusBadRequest, `decision must be "allow", "allow_always" or "deny"`)
+		return
+	}
 	if err := eng.RespondPermission(rid, body.Decision, body.Guidance); err != nil {
 		writeError(w, err)
 		return
@@ -382,6 +398,43 @@ func writeRaw(w http.ResponseWriter, raw json.RawMessage) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(raw)
+}
+
+// handleTasks answers a live tab's task list. Only the attach bridge can ask a
+// running maki for one, so web and stored kinds are 501 like the plan route is.
+// The rows pass through unchanged: maki owns their field names.
+func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	row, ok := s.row(id)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "unknown session")
+		return
+	}
+	if row.Kind != model.KindLive {
+		writeErr(w, http.StatusNotImplemented, "no task API for "+row.Kind+" sessions")
+		return
+	}
+	eng := s.cfg.Registry.EngineForKind(row.Kind)
+	if eng == nil {
+		writeErr(w, http.StatusNotImplemented, "no engine for kind "+row.Kind)
+		return
+	}
+	tk, ok := eng.(tasker)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "engine has no task API")
+		return
+	}
+	raw, err := tk.Tasks(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if len(raw) == 0 {
+		raw = json.RawMessage(tasksEmpty)
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Tasks json.RawMessage `json:"tasks"`
+	}{raw})
 }
 
 const (

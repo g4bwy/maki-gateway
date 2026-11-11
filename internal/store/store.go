@@ -240,14 +240,12 @@ func readLine(br *bufio.Reader, buf []byte, max int) ([]byte, error) {
 // Read-only engine: writes belong to the live and web engines. Title edits on
 // a stored session go through them once the session is open again, per the
 // registry routing (CONTRACTS 4).
-func (e *Engine) Prompt(string, string) (string, error) { return "", model.ErrUnsupported }
-func (e *Engine) Cancel(string) error                   { return model.ErrUnsupported }
-func (e *Engine) SetMode(string, string) error          { return model.ErrUnsupported }
-func (e *Engine) SetTitle(string, string) error         { return model.ErrUnsupported }
-func (e *Engine) Create(string, string, string) (string, error) {
-	return "", model.ErrUnsupported
-}
-func (e *Engine) Kill(string) error { return model.ErrUnsupported }
+func (e *Engine) Prompt(string, string) (string, error)      { return "", model.ErrUnsupported }
+func (e *Engine) Cancel(string) error                        { return model.ErrUnsupported }
+func (e *Engine) SetMode(string, string) error               { return model.ErrUnsupported }
+func (e *Engine) SetTitle(string, string) error              { return model.ErrUnsupported }
+func (e *Engine) Create(model.CreateRequest) (string, error) { return "", model.ErrUnsupported }
+func (e *Engine) Kill(string) error                          { return model.ErrUnsupported }
 
 // RespondPermission reports not found: a parked permission prompt only exists
 // while its TUI lives, so the request id never belongs to this engine.

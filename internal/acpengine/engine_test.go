@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -126,7 +128,7 @@ func newTestEngine(t *testing.T) (*Engine, *collector) {
 
 func create(t *testing.T, eng *Engine) string {
 	t.Helper()
-	id, err := eng.Create(t.TempDir(), "fake/model", "")
+	id, err := eng.Create(model.CreateRequest{Cwd: t.TempDir(), Model: "fake/model"})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -329,6 +331,100 @@ func TestPermissionUnknownDecisionKeepsAsk(t *testing.T) {
 	// The ask is still parked, so a real answer still goes through.
 	if err := eng.RespondPermission(asked.RequestID, decisionAllow, ""); err != nil {
 		t.Fatalf("retry after a bad decision: %v", err)
+	}
+}
+
+// TestPermissionAllowAlwaysPicksTheAlwaysOption is the wire check for the third
+// decision: the fake streams back the option id it was answered with.
+func TestPermissionAllowAlwaysPicksTheAlwaysOption(t *testing.T) {
+	eng, c := newTestEngine(t)
+	id := create(t, eng)
+
+	if _, err := eng.Prompt(id, FakePermission); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	asked := c.next(t, 10*time.Second, ofType("permission"))
+	if err := eng.RespondPermission(asked.RequestID, decisionAllowAlways, ""); err != nil {
+		t.Fatalf("RespondPermission: %v", err)
+	}
+	chunk := c.next(t, 10*time.Second, ofUpdate(updateMessageChunk))
+	if want := "option:" + optionAllowAlways; !jsonContains(t, chunk.ACP, want) {
+		t.Fatalf("agent saw %s, want %q", chunk.ACP, want)
+	}
+}
+
+// TestPermissionAllowAlwaysFallsBackToOnce covers the degradation: an agent that
+// offers no "always" option still gets an answer this side can send, and it is
+// the once form.
+func TestPermissionAllowAlwaysFallsBackToOnce(t *testing.T) {
+	eng, c := newTestEngine(t)
+	id := create(t, eng)
+
+	if _, err := eng.Prompt(id, FakePermission+" "+FakeNoAlways); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	asked := c.next(t, 10*time.Second, ofType("permission"))
+	if err := eng.RespondPermission(asked.RequestID, decisionAllowAlways, ""); err != nil {
+		t.Fatalf("RespondPermission: %v", err)
+	}
+	chunk := c.next(t, 10*time.Second, ofUpdate(updateMessageChunk))
+	if want := "option:" + optionAllowOnce; !jsonContains(t, chunk.ACP, want) {
+		t.Fatalf("agent saw %s, want the allow_once fallback %q", chunk.ACP, want)
+	}
+}
+
+// TestOptionForDecisionTable pins the whole decision map against the four options
+// maki-acp offers, plus the three-option agent.
+func TestOptionForDecisionTable(t *testing.T) {
+	full := []permissionOption{
+		{OptionID: optionAllowOnce, Kind: kindAllowOnce},
+		{OptionID: optionAllowAlways, Kind: kindAllowAlways},
+		{OptionID: optionRejectOnce, Kind: kindRejectOnce},
+		{OptionID: "reject_always", Kind: kindRejectAlways},
+	}
+	noAlways := []permissionOption{
+		{OptionID: optionAllowOnce, Kind: kindAllowOnce},
+		{OptionID: optionRejectOnce, Kind: kindRejectOnce},
+	}
+	// An agent that spells its ids differently is matched by kind.
+	byKind := []permissionOption{
+		{OptionID: "opt-1", Kind: kindAllowAlways},
+		{OptionID: "opt-2", Kind: kindRejectAlways},
+	}
+
+	cases := []struct {
+		name     string
+		options  []permissionOption
+		decision string
+		want     string
+		wantErr  bool
+	}{
+		{"allow full", full, decisionAllow, optionAllowOnce, false},
+		{"allow always full", full, decisionAllowAlways, optionAllowAlways, false},
+		{"deny full", full, decisionDeny, optionRejectOnce, false},
+		{"allow once only", noAlways, decisionAllow, optionAllowOnce, false},
+		{"allow always degrades", noAlways, decisionAllowAlways, optionAllowOnce, false},
+		{"deny once only", noAlways, decisionDeny, optionRejectOnce, false},
+		{"allow by kind", byKind, decisionAllow, "opt-1", false},
+		{"allow always by kind", byKind, decisionAllowAlways, "opt-1", false},
+		{"deny by kind", byKind, decisionDeny, "opt-2", false},
+		{"unknown decision", full, "maybe", "", true},
+		{"empty offer", nil, decisionAllow, "", true},
+		{"no always offer", []permissionOption{{OptionID: optionRejectOnce, Kind: kindRejectOnce}}, decisionAllowAlways, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := optionFor(tc.options, tc.decision)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("optionFor(%q) = %q, want an error", tc.decision, got)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("optionFor(%q) = %q, %v, want %q", tc.decision, got, err, tc.want)
+			}
+		})
 	}
 }
 
@@ -564,15 +660,69 @@ func TestCancelAnswersTheParkedAsk(t *testing.T) {
 	}
 }
 
+// spawnedArgv reads back the arguments the fake recorded for its own process.
+func spawnedArgv(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read recorded argv: %v", err)
+	}
+	return strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+}
+
+// TestCreateYoloPassesTheFlag is the argv check for yolo web sessions. The flag
+// belongs to the `acp` subcommand, so it must follow it: maki reads the global
+// --yolo only on the tui and print paths (src/cmd/acp.rs:108 takes the
+// subcommand field), which would make `maki --yolo acp` a silent no-op.
+func TestCreateYoloPassesTheFlag(t *testing.T) {
+	dir := t.TempDir()
+	argvPath := filepath.Join(dir, "argv")
+	t.Setenv(FakeArgvEnv, argvPath)
+
+	eng, _ := newTestEngine(t)
+	id, err := eng.Create(model.CreateRequest{Cwd: dir, Model: "fake/model", Yolo: true})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Kill(id) })
+
+	args := spawnedArgv(t, argvPath)
+	if len(args) < 2 || args[0] != argACP || args[1] != argYolo {
+		t.Fatalf("spawned %v, want %q first and %q next", args, argACP, argYolo)
+	}
+	if i := slices.Index(args, argModel); i < 0 || i+1 >= len(args) || args[i+1] != "fake/model" {
+		t.Fatalf("spawned %v, want the model spec after %q", args, argModel)
+	}
+}
+
+// TestCreateWithoutYoloPassesNoFlag: yolo is opt-in per request, and a plain
+// create must still park every prompt.
+func TestCreateWithoutYoloPassesNoFlag(t *testing.T) {
+	dir := t.TempDir()
+	argvPath := filepath.Join(dir, "argv")
+	t.Setenv(FakeArgvEnv, argvPath)
+
+	eng, _ := newTestEngine(t)
+	id, err := eng.Create(model.CreateRequest{Cwd: dir, Model: "fake/model"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Kill(id) })
+
+	if args := spawnedArgv(t, argvPath); slices.Contains(args, argYolo) {
+		t.Fatalf("spawned %v, want no %q", args, argYolo)
+	}
+}
+
 // TestCreateRejectsARelativeCwd keeps the guard that would otherwise cost a
 // child process per bad request: session/new demands an absolute cwd.
 func TestCreateRejectsARelativeCwd(t *testing.T) {
 	eng, _ := newTestEngine(t)
 
-	if _, err := eng.Create("relative/path", "", ""); !errors.Is(err, model.ErrUnsupported) {
+	if _, err := eng.Create(model.CreateRequest{Cwd: "relative/path"}); !errors.Is(err, model.ErrUnsupported) {
 		t.Fatalf("Create relative err = %v, want ErrUnsupported", err)
 	}
-	if _, err := eng.Create("", "", ""); err != nil {
+	if _, err := eng.Create(model.CreateRequest{}); err != nil {
 		t.Fatalf("Create with no cwd: %v", err)
 	}
 }
@@ -613,7 +763,10 @@ func TestRealMakiSession(t *testing.T) {
 
 	eng, c := newTestEngine(t)
 	eng.makiPath = path
-	id, err := eng.Create(t.TempDir(), "", "Reply with exactly one word: READY")
+	id, err := eng.Create(model.CreateRequest{
+		Cwd:    t.TempDir(),
+		Prompt: "Reply with exactly one word: READY",
+	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

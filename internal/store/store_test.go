@@ -391,7 +391,7 @@ func TestReadOnlyEngineMethods(t *testing.T) {
 	if _, err := e.Prompt("alpha", "hi"); err != model.ErrUnsupported {
 		t.Errorf("prompt: %v", err)
 	}
-	if _, err := e.Create("/c", "m", "p"); err != model.ErrUnsupported {
+	if _, err := e.Create(model.CreateRequest{Cwd: "/c", Model: "m", Prompt: "p"}); err != model.ErrUnsupported {
 		t.Errorf("create: %v", err)
 	}
 	for _, err := range []error{

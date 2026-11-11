@@ -76,6 +76,29 @@ type Event struct {
 	Code      *int            `json:"code,omitempty"`
 }
 
+// CreateRequest is one POST /api/sessions body (CONTRACTS 2). Yolo skips every
+// permission prompt in the new session. Only the web engine can honour it, and
+// the attach bridge reports the request to a plugin that ignores it.
+type CreateRequest struct {
+	Cwd    string
+	Model  string
+	Prompt string
+	Yolo   bool
+}
+
+// Permission decisions the HTTP API accepts (CONTRACTS 2). Each engine maps
+// them onto what its own protocol offers, and degrades where it has no match.
+const (
+	DecisionAllow       = "allow"
+	DecisionAllowAlways = "allow_always"
+	DecisionDeny        = "deny"
+)
+
+// IsDecision reports whether s names one of the three decisions the API accepts.
+func IsDecision(s string) bool {
+	return s == DecisionAllow || s == DecisionAllowAlways || s == DecisionDeny
+}
+
 // Engine is one source of sessions. acpengine, attach, and store implement it;
 // registry merges them. RespondPermission is routed by the caller to the engine
 // whose name matches the Event.Engine field of the permission event.
@@ -89,9 +112,13 @@ type Engine interface {
 	SetMode(id, mode string) error
 	SetTitle(id, title string) error
 	// Create spawns/opens a session. ErrUnsupported for read-only engines.
-	Create(cwd, m string, prompt string) (string, error)
+	Create(req CreateRequest) (string, error)
 	// Kill terminates an engine-owned process. ErrUnsupported otherwise.
 	Kill(id string) error
+	// RespondPermission answers a parked prompt. decision is one of
+	// DecisionAllow, DecisionAllowAlways or DecisionDeny, and guidance is free
+	// text only the attach bridge can deliver. An engine whose protocol has no
+	// "always" option answers the nearest one it has.
 	RespondPermission(requestID int64, decision, guidance string) error
 }
 

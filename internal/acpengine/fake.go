@@ -19,6 +19,8 @@ import (
 //
 //	(default)   stream thought, text, a tool call and its result, usage, end_turn
 //	@permission park a session/request_permission, then stream the chosen option
+//	@permission @noalways
+//	            the same ask, with no allow_always option to pick
 //	@ask        park an elicitation/create, then stream the action that answered it
 //	@reject     answer with -32603 "a prompt is already running", like a busy agent
 //	@hold       stream one chunk and never answer, until session/cancel
@@ -44,6 +46,7 @@ const (
 	FakeGiant       = "@giant"
 	FakeElsewhere   = "@elsewhere"
 	FakeDontAsk     = "@dontask"
+	FakeNoAlways    = "@noalways"
 	FakeSessionStem = "fake-"
 
 	fakeRejectDetail  = "a prompt is already running"
@@ -51,6 +54,20 @@ const (
 	fakeToolID        = "call-1"
 	fakeExitStatus    = 3
 )
+
+// FakeArgvEnv names a file the fake writes the arguments it was spawned with to,
+// one per line. A test that must see the argv the engine passed sets it: the
+// child inherits the environment, and the file is written before the handshake
+// answers, so a Create that returned can always read it back.
+const FakeArgvEnv = "MAKI_FAKE_ARGV"
+
+func recordArgv() {
+	path := os.Getenv(FakeArgvEnv)
+	if path == "" || len(os.Args) < 2 {
+		return
+	}
+	_ = os.WriteFile(path, []byte(strings.Join(os.Args[1:], "\n")), 0o600)
+}
 
 // NewFake writes frames to w. r is read by Serve, so it is not kept here.
 func NewFake(r io.Reader, w io.Writer) *Fake {
@@ -66,6 +83,7 @@ func NewFake(r io.Reader, w io.Writer) *Fake {
 // `acp` argument calls this instead of running tests, which is how the engine gets
 // a real child process in its tests.
 func ServeFakeStdio() error {
+	recordArgv()
 	f := NewFake(nil, os.Stdout)
 	return f.Serve(os.Stdin)
 }
@@ -198,7 +216,7 @@ func (f *Fake) handlePrompt(m *wireMessage) {
 	case strings.Contains(text, FakeExitAsk):
 		// Checked before @exit: its marker string contains it.
 		go func() {
-			f.request(f.nextRequestID(), methodRequestPermission, f.permissionBody(req.SessionID))
+			f.request(f.nextRequestID(), methodRequestPermission, f.permissionBody(req.SessionID, true))
 			f.wireFlush()
 			os.Exit(fakeExitStatus)
 		}()
@@ -216,7 +234,8 @@ func (f *Fake) handlePrompt(m *wireMessage) {
 			f.update(req.SessionID, chunk(updateMessageChunk, "held"))
 		}()
 	case strings.Contains(text, FakePermission):
-		go f.turnWithPermission(req.SessionID, id, !strings.Contains(text, FakeDontAsk))
+		go f.turnWithPermission(req.SessionID, id,
+			!strings.Contains(text, FakeDontAsk), !strings.Contains(text, FakeNoAlways))
 	case strings.Contains(text, FakeAsk):
 		go f.turnWithAsk(req.SessionID, id)
 	case strings.Contains(text, FakeGiant):
@@ -266,13 +285,13 @@ func (f *Fake) turnPlain(session string, prompt int64) {
 // turnWithPermission asks, waits for the answer, then streams what was picked so
 // a test can read the option id back out of the transcript. An ask the client
 // never answers leaves the turn open, which is what the die path is for.
-func (f *Fake) turnWithPermission(session string, prompt int64, ask bool) {
+func (f *Fake) turnWithPermission(session string, prompt int64, ask, always bool) {
 	if !ask {
 		f.update(session, chunk(updateMessageChunk, "never asked"))
 		f.endTurn(prompt, "end_turn")
 		return
 	}
-	f.request(f.nextRequestID(), methodRequestPermission, f.permissionBody(session))
+	f.request(f.nextRequestID(), methodRequestPermission, f.permissionBody(session, always))
 	answer := <-f.answers
 	chosen := outcomeCancelled
 	var res struct {
@@ -336,8 +355,19 @@ func (f *Fake) release(prompt int64) {
 }
 
 // permissionBody is the ask the real server writes (permissions.rs:23): the four
-// fixed option ids, with the tool call riding along as a ToolCallUpdate.
-func (f *Fake) permissionBody(session string) map[string]any {
+// fixed option ids, with the tool call riding along as a ToolCallUpdate. always
+// off drops the allow_always row, which is how a test asks what an agent that
+// offers three options gets.
+func (f *Fake) permissionBody(session string, always bool) map[string]any {
+	options := []permissionOption{
+		{OptionID: optionAllowOnce, Name: "Allow once", Kind: kindAllowOnce},
+		{OptionID: optionAllowAlways, Name: "Allow always", Kind: kindAllowAlways},
+		{OptionID: optionRejectOnce, Name: "Reject once", Kind: kindRejectOnce},
+		{OptionID: "reject_always", Name: "Reject always", Kind: kindRejectAlways},
+	}
+	if !always {
+		options = append(options[:1], options[2:]...)
+	}
 	return map[string]any{
 		"sessionId": session,
 		"toolCall": map[string]any{
@@ -348,12 +378,7 @@ func (f *Fake) permissionBody(session string) map[string]any {
 			"rawInput":   map[string]string{"command": "ls"},
 			"locations":  []map[string]any{{"path": "/tmp/a.txt"}},
 		},
-		"options": []permissionOption{
-			{OptionID: optionAllowOnce, Name: "Allow once", Kind: kindAllowOnce},
-			{OptionID: "allow_always", Name: "Allow always", Kind: kindAllowAlways},
-			{OptionID: optionRejectOnce, Name: "Reject once", Kind: kindRejectOnce},
-			{OptionID: "reject_always", Name: "Reject always", Kind: kindRejectAlways},
-		},
+		"options": options,
 	}
 }
 

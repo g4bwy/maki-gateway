@@ -31,6 +31,7 @@ type fakeTUI struct {
 	conns    []net.Conn
 	frames   []map[string]any  // every request frame received
 	list     []map[string]any  // what the list op answers
+	tasks    []map[string]any  // what the tasks op answers
 	parked   map[int64]string  // permission request id -> decision wanted
 	answered []int64           // ids the gateway answered
 	frozen   bool              // stop answering ping
@@ -73,6 +74,7 @@ func newFakeTUI(t *testing.T, dir, name string, pid int, tabs ...map[string]any)
 	} else {
 		f.list = []map[string]any{liveTab("s1", "idle")}
 	}
+	f.tasks = fakeTaskRows()
 	f.listen()
 	t.Cleanup(f.stop)
 	return f
@@ -261,8 +263,10 @@ func (f *fakeTUI) answer(frame map[string]any) (ok any, fail string, hang bool) 
 		}
 		return map[string]any{"mode": "plan", "path": "/tmp/plan.md", "ready": true,
 			"content": "# plan"}, "", false
-	case opSetMode, opSetTitle, "notify", opPerms, "pop_queue", "tasks":
+	case opSetMode, opSetTitle, "notify", opPerms, "pop_queue":
 		return true, "", false
+	case opTasks:
+		return f.tasksSnapshot(), "", false
 	case opRespond:
 		return f.respond(frame)
 	}
@@ -289,6 +293,32 @@ func (f *fakeTUI) waitForAnswer(t *testing.T, id int64) {
 		defer f.mu.Unlock()
 		return slices.Contains(f.answered, id)
 	})
+}
+
+// fakeTaskRows is maki.task.list() as the host writes it (maki-ui/src/app/tasks.rs
+// TaskInfo): the main chat first, with no status, then one working subagent.
+func fakeTaskRows() []map[string]any {
+	return []map[string]any{
+		{"id": "main", "session": "s1", "name": "main", "focused": true},
+		{"id": "tu1", "session": "s1", "name": "explore the repo", "status": "working",
+			"tool": "task", "focused": false, "started_at": 1700000000, "cost": 0.02},
+	}
+}
+
+func (f *fakeTUI) tasksSnapshot() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// A plugin with no tasks answers an empty list, so the fake must not answer
+	// a nil slice, which is JSON null.
+	out := make([]map[string]any, 0, len(f.tasks))
+	return append(out, f.tasks...)
+}
+
+// setTasks replaces what the tasks op answers.
+func (f *fakeTUI) setTasks(rows ...map[string]any) {
+	f.mu.Lock()
+	f.tasks = rows
+	f.mu.Unlock()
 }
 
 func (f *fakeTUI) snapshot() []map[string]any {

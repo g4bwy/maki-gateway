@@ -111,6 +111,24 @@ local EVENTS = {
       return { model = protocol.model(d.model) }
     end,
   },
+  -- A task is not a tab, so a subagent starting, finishing or being stopped
+  -- moves no other event. One wire event covers both host events, and it names
+  -- no task: the gateway reads task rows with the `tasks` op, so the browser
+  -- that hears this refetches them.
+  {
+    host = "TaskStatusChanged",
+    wire = "tasks_changed",
+    build = function()
+      return {}
+    end,
+  },
+  {
+    host = "TaskStopped",
+    wire = "tasks_changed",
+    build = function()
+      return {}
+    end,
+  },
 }
 
 --- A host event as one fan-out call. Handlers only queue a line, so they never

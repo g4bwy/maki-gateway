@@ -363,11 +363,13 @@ named `outcome` whose value is an enum tagged `outcome`
 `{"outcome":{"outcome":"cancelled"}}` (`server.rs:1377`).
 
 `decision` maps to an option id, and `guidance` is dropped: ACP has no field for
-it. `allow` picks `allow_once`, `deny` picks `reject_once`, each falling back to
-any option whose `kind` has the same shape. The ids this side offers the browser
-(`allow`/`deny`) are the contract's, not the agent's, and `allow_always` and
-`reject_always` stay unreachable from the web UI on purpose, because each one
-writes a rule nobody asked for.
+it. `allow` picks `allow_once`, `allow_always` picks `allow_always`, and `deny`
+picks `reject_once`, each falling back to any option whose `kind` has the same
+shape (`optionFor` in `wire.go`). An agent that offers no "always" option gets
+`allow_once` for `allow_always`, because a degraded answer beats a dialog that
+stays parked. The ids this side offers the browser (`allow`/`allow_always`/`deny`)
+are the contract's, not the agent's, and `reject_always` stays unreachable from
+the web UI on purpose, because it writes a rule nobody asked for.
 
 Any reply the agent cannot read becomes a deny (`server.rs:893-901`), including
 an error response, so a written-but-malformed answer fails closed.
@@ -505,9 +507,16 @@ report the death.
 
 ## 10. Process lifecycle, and what the fake must copy
 
-- Spawn: `<makiPath> acp`, plus `-m <model>` when a model was asked for, and
-  never `--yolo`. The web UI answers permission prompts, and auto-allow takes
-  that choice away from the user (`src/cli.rs:428-435` names both flags).
+- Spawn: `<makiPath> acp`, plus `-m <model>` when a model was asked for, plus
+  `--yolo` when the create request asked for a session that skips every prompt
+  (CONTRACTS 2). Nothing else. The web UI answers permission prompts, so yolo is
+  the caller's choice per session, never the default.
+  `src/cli.rs:428-435` names both flags, and the order matters: `--yolo` is the
+  flag of the `acp` subcommand (`src/cmd/acp.rs:108` reads it), and the global
+  flag of the same name (`src/cli.rs:145`) reaches the tui and print paths only,
+  so `maki --yolo acp` starts a session that still asks. The fake records its own
+  argv when `MAKI_FAKE_ARGV` names a file, which is how the tests read these
+  flags back.
 - The child starts with no session. `initialize` then `session/new` run once, in
   that order, inside `Create`, so `Create` returns a usable session id.
 - stdin stays open for the process's life. `Kill` closes it, waits 3 s, then

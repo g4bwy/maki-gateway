@@ -47,6 +47,10 @@ func (c *conn) handleEvent(m *message) {
 		// No model field exists in the SSE envelope, so a model change is a
 		// plain status event: the client refetches and sees the new model.
 		c.e.publish(model.Event{Type: evStatus, Session: m.Session})
+	case "tasks_changed":
+		// A task started, moved, or stopped. maki sends no task rows on the
+		// socket, so the browser refetches GET /api/sessions/{id}/tasks.
+		c.e.publish(model.Event{Type: evTasks, Session: m.Session})
 	case "question":
 		c.e.publish(model.Event{Type: evNotice, Text: questionNotice})
 	case evPermission:

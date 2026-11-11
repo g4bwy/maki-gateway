@@ -155,14 +155,14 @@ func TestSetModeAndSetTitle(t *testing.T) {
 func TestCreateUsesTheFirstLiveConn(t *testing.T) {
 	dir := t.TempDir()
 	e, _ := startEngine(t, dir, fastTimings())
-	if _, err := e.Create("/work", "model", "hi"); !errors.Is(err, model.ErrNotFound) {
+	if _, err := e.Create(model.CreateRequest{Cwd: "/work", Model: "model", Prompt: "hi"}); !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("no tui must map to ErrNotFound, got %v", err)
 	}
 	first := newFakeTUI(t, dir, "pid-1.sock", 1)
 	second := newFakeTUI(t, dir, "pid-2.sock", 2)
 	waitFor(t, "both plugins to be tracked", func() bool { return e.connCount() == 2 })
 
-	id, err := e.Create("/work", "model", "start here")
+	id, err := e.Create(model.CreateRequest{Cwd: "/work", Model: "model", Prompt: "start here"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,6 +213,95 @@ func TestPlanForwardsTheSocketAnswer(t *testing.T) {
 	}
 	if _, err := e.Plan("nope"); !errors.Is(err, model.ErrNotFound) {
 		t.Errorf("unknown session: %v", err)
+	}
+}
+
+// TestTasksForwardsTheSocketAnswer: the rows reach the caller as maki wrote them,
+// and the frame names no session, because the host only lists the focused tab.
+func TestTasksForwardsTheSocketAnswer(t *testing.T) {
+	f, e, _ := setup(t)
+	raw, err := e.Tasks("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatalf("tasks passthrough: %s", raw)
+	}
+	if len(rows) != 2 || rows[0]["id"] != "main" || rows[0]["status"] != nil ||
+		rows[1]["status"] != "working" || rows[1]["tool"] != "task" {
+		t.Fatalf("tasks = %s", raw)
+	}
+	fr := f.frameWithOp(opTasks)
+	if fr == nil {
+		t.Fatalf("the tasks op never reached the plugin, saw %v", f.opsSeen())
+	}
+	if _, has := fr[argSession]; has {
+		t.Errorf("the tasks op takes no session argument: %v", fr)
+	}
+	// No rows is still a list, not null.
+	f.setTasks()
+	if raw, err = e.Tasks("s1"); err != nil || string(raw) != "[]" {
+		t.Fatalf("empty tasks = %s, %v", raw, err)
+	}
+	f.failWith(opTasks, "unknown session: s9")
+	if _, err := e.Tasks("s1"); !errors.Is(err, model.ErrNotFound) {
+		t.Errorf("plugin error mapping: %v", err)
+	}
+}
+
+// TestTasksChangedEventMapsToTasks is the live half of task visibility: one hub
+// event per plugin event, with the session the task belongs to.
+func TestTasksChangedEventMapsToTasks(t *testing.T) {
+	f, _, ch := setup(t)
+	f.push(map[string]any{"event": "tasks_changed", "session": "s1"})
+	ev := wantEvent(t, ch, evTasks)
+	if ev.Type != evTasks || ev.Session != "s1" {
+		t.Errorf("tasks event: %+v", ev)
+	}
+	if extra := drain(ch); len(extra) != 0 {
+		t.Errorf("a task change publishes tasks only: %+v", extra)
+	}
+}
+
+// TestRespondAllowAlwaysSendsAllow pins the degradation: the bridge verdict is
+// binary, so "always" is dropped here rather than reaching Lua.
+func TestRespondAllowAlwaysSendsAllow(t *testing.T) {
+	f, e, ch := setup(t)
+	f.pushPermission(81, "s1", "bash", map[string]any{"command": "ls"})
+	if ev := wantEvent(t, ch, evPermission); ev.RequestID != 81 {
+		t.Fatalf("permission event: %+v", ev)
+	}
+	if err := e.RespondPermission(81, model.DecisionAllowAlways, "remember it"); err != nil {
+		t.Fatal(err)
+	}
+	f.waitForAnswer(t, 81)
+	fr := f.frameWithOp(opRespond)
+	if fr == nil || fr[argDecision] != model.DecisionAllow {
+		t.Fatalf("respond frame: %v, want decision %q", fr, model.DecisionAllow)
+	}
+	if fr[argGuidance] != "remember it" {
+		t.Errorf("guidance must still travel: %v", fr)
+	}
+}
+
+// TestCreateYoloTravelsToTheNewOp: the field is only sent when asked for, and the
+// plugin that does not know it keeps working.
+func TestCreateYoloTravelsToTheNewOp(t *testing.T) {
+	f, e, _ := setup(t)
+	if _, err := e.Create(model.CreateRequest{Cwd: "/work", Prompt: "go"}); err != nil {
+		t.Fatal(err)
+	}
+	if fr := f.frameWithOp(opNew); fr != nil {
+		if _, has := fr[argYolo]; has {
+			t.Errorf("a plain create sends no yolo: %v", fr)
+		}
+	}
+	if _, err := e.Create(model.CreateRequest{Cwd: "/work", Prompt: "go", Yolo: true}); err != nil {
+		t.Fatal(err)
+	}
+	if fr := f.frameWithOp(opNew); fr[argYolo] != true {
+		t.Fatalf("yolo create frame: %v", fr)
 	}
 }
 

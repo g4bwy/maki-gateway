@@ -59,10 +59,13 @@ func(string) string; Static http.Handler; Engines []model.Engine; Ctx context.Co
 ### Resolved ambiguities (implement exactly)
 1. Mutation routing by merged row KIND, never EngineFor: web→acp engine, live→attach. Unknown id
    404. Stored: prompt/cancel 404; mode/title 405.
-2. /api/plan, /api/search, /api/analytics are NOT on model.Engine. Probe optional interfaces
+2. /api/plan, /api/search, /api/analytics, /api/sessions/{id}/tasks are NOT on
+   model.Engine. Probe optional interfaces
    locally: `planner{Plan(id string) (json.RawMessage, error)}`, `searcher{Search(q string, limit
    int) ([]SearchHit, error)}` with SearchHit{Session,Title,Snippet string}, `analyst{Analytics(days
-   int) (json.RawMessage, error)}`. Fallback if absent: search scans Messages(id,200) of merged
+   int) (json.RawMessage, error)}`, `tasker{Tasks(id string) (json.RawMessage, error)}`. Only the
+   attach engine is a tasker, and a tasks request answers 501 for kind web and kind stored
+   (unlike stored mode/title, which answer 405, and unlike stored prompt, which answers 404). Fallback if absent: search scans Messages(id,200) of merged
    sessions case-insensitive substring, cap 50, snippet from type:"text" blocks; analytics returns
    per_session from registry rows with zero cost and daily []. plan on web kind = 501 per contract.
 3. Cancel on live kind: return 501 directly (do not trust engine error text).

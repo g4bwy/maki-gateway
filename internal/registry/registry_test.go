@@ -43,7 +43,7 @@ func (f *fakeEngine) Prompt(string, string) (string, error)         { return "",
 func (f *fakeEngine) Cancel(string) error                           { return model.ErrUnsupported }
 func (f *fakeEngine) SetMode(string, string) error                  { return model.ErrUnsupported }
 func (f *fakeEngine) SetTitle(string, string) error                 { return model.ErrUnsupported }
-func (f *fakeEngine) Create(string, string, string) (string, error) { return "", model.ErrUnsupported }
+func (f *fakeEngine) Create(model.CreateRequest) (string, error)    { return "", model.ErrUnsupported }
 func (f *fakeEngine) Kill(string) error                             { return model.ErrUnsupported }
 func (f *fakeEngine) RespondPermission(int64, string, string) error { return model.ErrNotFound }
 

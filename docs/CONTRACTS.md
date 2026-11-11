@@ -30,16 +30,16 @@ Events: `{"event": "<name>", ...}`, never carry `id`.
 | list | — | `[{"id":str,"title":str,"status":"working"\|"needs_input"\|"idle","cwd":str,"model":str,"focused":bool}]` | live TUI tabs only |
 | messages | `session?`, `last:int` | `{"messages":[Message]}` | Message = native maki JSON (see 3); always pass session+last |
 | prompt | `session`, `text` | `"started"` \| `"queued"` | error `"session not live: <id>"` |
-| new | `prompt?`, `cwd?` | `{"session":id}` | opens background TUI tab; omit focus |
+| new | `prompt?`, `cwd?`, `yolo?` | `{"session":id}` | opens background TUI tab, omit focus. The gateway copies `yolo:true` from a yolo create, and the plugin ignores it: a tab of a running TUI cannot skip the prompts its process was started with |
 | set_mode | `session`, `mode:"build"\|"plan"` | `true` | |
 | set_title | `session`, `title:\|null` | `true` | null clears |
 | notify | `text`, `session?` | `true` | |
 | plan | `session` | `{"mode":str,"path":str,"ready":bool,"content":str?}` | |
-| tasks | — | `[{"id":str,"status":str,...}]` | passthrough of maki.task.list |
+| tasks | — | `[{"id":str,"session":id,"name":str,"focused":bool,"status"?:str,...}]` | passthrough of `maki.task.list()`. The host lists the chats of the focused session only and takes no session argument, so the rows are whatever that TUI has on screen. Row 1 is the main chat, with `id:"main"` and no `status`. `status` is one of `"working"`, `"idle"`, `"done"`, `"error"`, `"cancelled"`. The optional fields stay away rather than arrive null: `tool` for the tool whose call runs (`"task"` or `"bash"`), `parent` for the call it runs under, `part`:bool, `wrapper`:bool, `plugin` for a task a plugin opened, `started_at` and `ended_at` in Unix seconds, `cost` in dollars |
 | run_command | `cmdline` | `<result>` | plugin MUST reject cmdline starting with `/reload` |
 | pop_queue | `session?` | `true` | removes first queued input of focused tab |
 | permissions | `on:bool` | `true` | toggles the permission slot bridge |
-| respond | `request_id:int`, `decision:"allow"\|"deny"`, `guidance?` | `true` | answers a `permission` event |
+| respond | `request_id:int`, `decision:"allow"\|"deny"`, `guidance?` | `true` | answers a `permission` event. The two verdicts are all the slot wrapper can give, so the gateway answers `allow_always` as `allow` (see 2) |
 
 ### events (plugin -> gateway)
 
@@ -55,12 +55,15 @@ Events: `{"event": "<name>", ...}`, never carry `id`.
 | question | `session` | raised when a tab enters needs_input and the question tool is the cause (best effort; may be a plain input wait) |
 | permission | `request_id,session,tool,input` | only while permissions bridge on |
 | permission_cancel | `request_id` | bridge parked >=55 s and fell through to the terminal prompt |
+| tasks_changed | `session` | TaskStatusChanged, TaskStopped. One event per task that started, moved or stopped. It names no task, because the browser reads the rows with the `tasks` op. `session` is the tab the task belongs to, which is not always the focused one the `tasks` op answers |
 
 Permission bridge semantics: the `permission.prompt` slot wrapper pushes a `permission` event to
 all connections, then polls a pending-answers table every 500 ms (sleep yields, never holds the
 VM). Answer `allow` -> `{decision="allow"}`, `deny` -> `{decision="deny",guidance=...}`. At 55 s
 with no answer, call `prev(req, ctx)` (fall through to the human prompt) and emit
-`permission_cancel`. `respond` for an unknown/expired id replies `error:"expired"`.
+`permission_cancel`. `respond` for an unknown/expired id replies `error:"expired"`. The host slot
+has no "remember this" answer, so an `allow_always` decision from the browser arrives here as
+`allow` and the live tab asks again on the next call.
 
 ## 2. HTTP API (gateway <-> browser)
 
@@ -77,14 +80,15 @@ seeds the session. A loopback bind needs no credential and never sets a cookie.
 |---|---|---|
 | GET /api/health | — | `{"version":str,"maki":str,"sessions":int}` |
 | GET /api/sessions | — | `[Session]` (model.Session JSON, below) |
-| POST /api/sessions | `{"cwd":str,"model"?:str,"prompt"?:str}` | 201 `{"session":id}` — spawns `maki acp`. Missing or empty `cwd` is 400 `{"error":"cwd is required"}`: the gateway refuses to spawn in its own directory |
+| POST /api/sessions | `{"cwd":str,"model"?:str,"prompt"?:str,"yolo"?:bool}` | 201 `{"session":id}` — spawns `maki acp`. Missing or empty `cwd` is 400 `{"error":"cwd is required"}`: the gateway refuses to spawn in its own directory. `yolo:true` spawns `maki acp --yolo`, so the session answers every permission prompt without asking. The flag belongs to the `acp` subcommand, and maki reads the global flag of the same name on other run paths only, so it goes after `acp`. A live session cannot be yolo: the bridge reports the request to the plugin and the plugin ignores it |
 | DELETE /api/sessions/{id} | — | `{"killed":bool}` — kills a **web** process only; 400 for live/stored |
 | GET /api/sessions/{id}/messages?last=200 | — | `{"source":"acp"\|"attach"\|"file","messages":[Message]}` |
 | POST /api/sessions/{id}/prompt | `{"text":str}` | `{"state":"started"\|"queued"}`; 409 `{"error":"busy"}` when a web session is mid-prompt; 409 `"open elsewhere"` on claim clash |
 | POST /api/sessions/{id}/cancel | — | `{"cancelled":bool}`; 501 for live sessions (no plugin API exists yet), 404 for stored ones (nothing runs to stop) |
 | POST /api/sessions/{id}/mode | `{"mode":"build"\|"plan"}` | `{"ok":true}` |
 | POST /api/sessions/{id}/title | `{"title":str\|null}` | `{"ok":true}`. Rename is live-only: kind `web` answers 501 (`maki-acp` dispatches no `session/set_title`), kind `stored` answers 405 |
-| POST /api/permissions/{engine}/{request_id} | `{"decision":"allow"\|"deny","guidance"?:str}` | `{"ok":true}`; 404 expired. `{engine}` is `"acp"` or `"attach"`; request ids are per-engine counters |
+| POST /api/permissions/{engine}/{request_id} | `{"decision":"allow"\|"allow_always"\|"deny","guidance"?:str}` | `{"ok":true}`, 404 expired, 400 for any other decision. `{engine}` is `"acp"` or `"attach"`, and request ids are per-engine counters. `allow` answers `allow_once` on the ACP wire, `allow_always` answers `allow_always`, and an agent that offers no "always" option gets `allow_once`. The attach bridge has no "always" verdict to give, so `allow_always` arrives as `allow` and only the web engine remembers the answer |
+| GET /api/sessions/{id}/tasks | — | `{"tasks":[TaskInfo]}`, the rows of the socket `tasks` op with the field names of section 1. 501 for kind `web` and kind `stored`, since only a running TUI has tasks. 404 for an id no engine reports |
 | GET /api/plan/{id} | — | plan object as in socket `plan` op. 501 for web sessions and for stored sessions, since only the attach bridge can read a plan |
 | GET /api/search?q= | — | `{"hits":[{"session":id,"snippet":str,"title":str}]}` (substring scan of jsonl, cap 50) |
 | GET /api/analytics?days=30 | — | `{"daily":[{"date":"YYYY-MM-DD","sessions":int,"input":int,"output":int,"cache_read":int,"cache_creation":int,"cost":num}],"per_session":[{"session":id,"title":str,"model":str,"cost":num,"updated_at":int}]}` |
@@ -102,6 +106,7 @@ seeds the session. A loopback bind needs no credential and never sets a cookie.
 | status | `session` plus any of `status?`, `title?`, `focused?`, `engine?` | one session changed. Every field but `session` is optional and appears only when the source knew it: a plugin tab reports `status,title,focused`, a rename sends `title` alone, a model change sends `session` alone, and a web session sends `status,title,engine` with no `focused`. Patch the fields that are present and refetch the list |
 | permission | `request_id,session,tool,input,engine:"acp"\|"attach"` | show dialog; answer via POST /api/permissions |
 | permission_cancel | `request_id` | dialog withdrawn (fell through / answered elsewhere) |
+| tasks | `session` | a task of a live session started, moved or stopped: refetch GET /api/sessions/{id}/tasks |
 | notice | `text` | toast (process exit, plugin connect/disconnect) |
 | exit | `session,code:int\|null` | web process terminated |
 

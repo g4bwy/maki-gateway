@@ -23,7 +23,7 @@ type fakeEngine struct {
 	cancelF  func(id string) error
 	modeF    func(id, mode string) error
 	titleF   func(id, title string) error
-	createF  func(cwd, m, prompt string) (string, error)
+	createF  func(req model.CreateRequest) (string, error)
 	killF    func(id string) error
 	respondF func(rid int64, decision, guidance string) error
 }
@@ -65,11 +65,11 @@ func (f *fakeEngine) SetTitle(id, title string) error {
 	return f.titleF(id, title)
 }
 
-func (f *fakeEngine) Create(cwd, m, prompt string) (string, error) {
+func (f *fakeEngine) Create(req model.CreateRequest) (string, error) {
 	if f.createF == nil {
 		return "", model.ErrUnsupported
 	}
-	return f.createF(cwd, m, prompt)
+	return f.createF(req)
 }
 
 func (f *fakeEngine) Kill(id string) error {
@@ -107,6 +107,16 @@ func (c *capEngine) Search(_ string, limit int) ([]SearchHit, error) {
 }
 
 func (c *capEngine) Analytics(int) (json.RawMessage, error) { return c.analyticsRaw, c.analyticsErr }
+
+// taskEngine is the tasker probe: only the attach engine answers a task list, so
+// it is a type of its own rather than another capEngine method.
+type taskEngine struct {
+	*fakeEngine
+	tasksRaw json.RawMessage
+	tasksErr error
+}
+
+func (t *taskEngine) Tasks(string) (json.RawMessage, error) { return t.tasksRaw, t.tasksErr }
 
 func textMessage(text string) model.Message {
 	return model.Message{Role: "user", Content: json.RawMessage(`[{"type":"text","text":` + jsonEncode(text) + `}]`)}
@@ -184,7 +194,7 @@ func TestAllRoutesResolve(t *testing.T) {
 	acp.cancelF = func(string) error { return nil }
 	acp.modeF = func(string, string) error { return nil }
 	acp.titleF = func(string, string) error { return nil }
-	acp.createF = func(string, string, string) (string, error) { return "w2", nil }
+	acp.createF = func(model.CreateRequest) (string, error) { return "w2", nil }
 	acp.killF = func(string) error { return nil }
 	acp.msgsF = func(string, int) ([]model.Message, error) { return []model.Message{textMessage("m")}, nil }
 	att.msgsF = func(string, int) ([]model.Message, error) { return nil, nil }
@@ -283,20 +293,37 @@ func TestEmptyListNeverNull(t *testing.T) {
 
 func TestCreateSession(t *testing.T) {
 	acp, att, st := trio()
-	var gotCwd, gotModel, gotPrompt string
-	acp.createF = func(cwd, m, prompt string) (string, error) {
-		gotCwd, gotModel, gotPrompt = cwd, m, prompt
+	var got model.CreateRequest
+	acp.createF = func(req model.CreateRequest) (string, error) {
+		got = req
 		return "w2", nil
 	}
 	s, _ := newTestServer(t, nil, acp, att, st)
 	rec := do(s, "POST", "/api/sessions", `{"cwd":"/tmp/demo","model":"opus","prompt":"start"}`)
 	wantStatus(t, rec, 201)
 	wantBody(t, rec, `{"session":"w2"}`)
-	if gotCwd != "/tmp/demo" || gotModel != "opus" || gotPrompt != "start" {
-		t.Fatalf("create args = %q %q %q", gotCwd, gotModel, gotPrompt)
+	if got.Cwd != "/tmp/demo" || got.Model != "opus" || got.Prompt != "start" || got.Yolo {
+		t.Fatalf("create args = %+v", got)
 	}
 	if rec := do(s, "POST", "/api/sessions", `not json`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad body: %d, want 400", rec.Code)
+	}
+}
+
+// TestCreateYolo is the POST body half of the yolo flag: the field is optional,
+// and only true reaches the engine.
+func TestCreateYolo(t *testing.T) {
+	acp, att, st := trio()
+	var got []model.CreateRequest
+	acp.createF = func(req model.CreateRequest) (string, error) {
+		got = append(got, req)
+		return "w2", nil
+	}
+	s, _ := newTestServer(t, nil, acp, att, st)
+	wantStatus(t, do(s, "POST", "/api/sessions", `{"cwd":"/tmp/demo","yolo":true}`), 201)
+	wantStatus(t, do(s, "POST", "/api/sessions", `{"cwd":"/tmp/demo"}`), 201)
+	if len(got) != 2 || !got[0].Yolo || got[0].Cwd != "/tmp/demo" || got[1].Yolo {
+		t.Fatalf("create requests = %+v", got)
 	}
 }
 
@@ -305,7 +332,7 @@ func TestCreateSession(t *testing.T) {
 func TestCreateRequiresCwd(t *testing.T) {
 	acp, att, st := trio()
 	creates := 0
-	acp.createF = func(string, string, string) (string, error) {
+	acp.createF = func(model.CreateRequest) (string, error) {
 		creates++
 		return "w2", nil
 	}
@@ -481,6 +508,70 @@ func TestPermissionRouting(t *testing.T) {
 	expired := &fakeEngine{kind: model.KindLive, rows: att.rows}                         // respondF nil -> ErrNotFound
 	s2, _ := newTestServer(t, nil, expired)
 	wantStatus(t, do(s2, "POST", "/api/permissions/attach/1", `{"decision":"allow"}`), 404)
+}
+
+// TestPermissionDecisionValues: the API takes three decisions and refuses every
+// other spelling before an engine sees it, so a typo cannot leave a dialog parked.
+func TestPermissionDecisionValues(t *testing.T) {
+	acp, att, st := trio()
+	var got string
+	acp.respondF = func(_ int64, decision, _ string) error {
+		got = decision
+		return nil
+	}
+	s, _ := newTestServer(t, nil, acp, att, st)
+	for _, d := range []string{"allow", "allow_always", "deny"} {
+		rec := do(s, "POST", "/api/permissions/acp/3", `{"decision":"`+d+`"}`)
+		wantStatus(t, rec, 200)
+		if got != d {
+			t.Fatalf("decision = %q, want %q", got, d)
+		}
+	}
+	for _, body := range []string{`{"decision":"always"}`, `{"decision":"reject_always"}`, `{}`, `{"decision":"ALLOW"}`} {
+		if rec := do(s, "POST", "/api/permissions/acp/3", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status %d, want 400", body, rec.Code)
+		}
+	}
+}
+
+// TestTasksRouting: only a live session has a task list, and the rows pass
+// through with the field names maki gave them.
+func TestTasksRouting(t *testing.T) {
+	acp, att, st := trio()
+	live := &taskEngine{fakeEngine: att, tasksRaw: json.RawMessage(
+		`[{"id":"main","session":"s1","name":"main","focused":true},` +
+			`{"id":"tu1","session":"s1","name":"explore","status":"working","tool":"task","focused":false,"cost":0.02}]`)}
+	s, _ := newTestServer(t, nil, acp, live, st)
+
+	rec := do(s, "GET", "/api/sessions/l1/tasks", "")
+	wantStatus(t, rec, 200)
+	var body struct {
+		Tasks []map[string]any `json:"tasks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Tasks) != 2 || body.Tasks[0]["id"] != "main" ||
+		body.Tasks[1]["status"] != "working" || body.Tasks[1]["cost"] != 0.02 {
+		t.Fatalf("tasks passthrough = %s", rec.Body.String())
+	}
+	// web and stored kinds have no task API, and an unknown id has no row.
+	wantStatus(t, do(s, "GET", "/api/sessions/w1/tasks", ""), http.StatusNotImplemented)
+	wantStatus(t, do(s, "GET", "/api/sessions/s1/tasks", ""), http.StatusNotImplemented)
+	wantStatus(t, do(s, "GET", "/api/sessions/nope/tasks", ""), http.StatusNotFound)
+	// A live engine without the capability answers 501 too.
+	plain, _ := newTestServer(t, nil, acp, att, st)
+	wantStatus(t, do(plain, "GET", "/api/sessions/l1/tasks", ""), http.StatusNotImplemented)
+	// An empty payload is still a list.
+	empty := &taskEngine{fakeEngine: att}
+	noRows, _ := newTestServer(t, nil, acp, empty, st)
+	rec = do(noRows, "GET", "/api/sessions/l1/tasks", "")
+	wantStatus(t, rec, 200)
+	wantBody(t, rec, `{"tasks":[]}`)
+	// A plugin error keeps its status mapping.
+	bad := &taskEngine{fakeEngine: att, tasksErr: model.ErrNotFound}
+	errSrv, _ := newTestServer(t, nil, acp, bad, st)
+	wantStatus(t, do(errSrv, "GET", "/api/sessions/l1/tasks", ""), http.StatusNotFound)
 }
 
 func TestPlanRouting(t *testing.T) {

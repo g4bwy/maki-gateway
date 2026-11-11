@@ -29,9 +29,12 @@ const (
 	defaultLast    = 200
 	defaultDays    = 30
 	searchCap      = 50
-	sseRetry       = "retry: 3000\n\n"
-	ssePing        = ": ping\n\n"
-	pingInterval   = 20 * time.Second
+	// tasksEmpty stands in when a plugin answers the tasks op with no value, so
+	// GET /api/sessions/{id}/tasks always holds a list rather than null.
+	tasksEmpty   = "[]"
+	sseRetry     = "retry: 3000\n\n"
+	ssePing      = ": ping\n\n"
+	pingInterval = 20 * time.Second
 )
 
 // Config wires the server to its dependencies (DESIGN_CORE).

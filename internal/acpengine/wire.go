@@ -43,19 +43,22 @@ const (
 	statusCompleted  = "completed"
 	statusFailed     = "failed"
 
-	optionAllowOnce  = "allow_once"
-	optionRejectOnce = "reject_once"
-	kindAllowOnce    = "allow_once"
-	kindAllowAlways  = "allow_always"
-	kindRejectOnce   = "reject_once"
-	kindRejectAlways = "reject_always"
+	optionAllowOnce   = "allow_once"
+	optionAllowAlways = "allow_always"
+	optionRejectOnce  = "reject_once"
+	kindAllowOnce     = "allow_once"
+	kindAllowAlways   = "allow_always"
+	kindRejectOnce    = "reject_once"
+	kindRejectAlways  = "reject_always"
 
 	outcomeSelected  = "selected"
 	outcomeCancelled = "cancelled"
 	actionCancel     = "cancel"
 
-	decisionAllow = "allow"
-	decisionDeny  = "deny"
+	// The three decisions of CONTRACTS 2, spelled once in internal/model.
+	decisionAllow       = model.DecisionAllow
+	decisionAllowAlways = model.DecisionAllowAlways
+	decisionDeny        = model.DecisionDeny
 
 	modeBuild = "build"
 	modePlan  = "plan"
@@ -79,6 +82,8 @@ const (
 
 	argACP   = "acp"
 	argModel = "-m"
+	// argYolo is the acp subcommand's own flag, not the global one (see spawn).
+	argYolo = "--yolo"
 )
 
 // wireRequest is one outgoing frame. A nil ID makes it a notification.
@@ -157,29 +162,59 @@ func mapWireError(e *wireError) error {
 
 var errNoOption = errors.New("permission offers no matching option")
 
-// optionFor picks the option id a decision names. allow prefers the literal
-// allow_once and falls back to any allow-shaped kind; deny rejects once.
-// Anything the server did not offer is refused rather than guessed at.
+// optionFor picks the option id a decision names. The four ids maki-acp offers
+// are fixed (permissions.rs:6-9), but the answer is still read out of the options
+// of this one request, and anything the agent did not offer is refused rather
+// than guessed at.
+//
+//	allow        -> allow_once, then any allow-shaped option
+//	allow_always -> allow_always, then allow_once
+//	deny         -> reject_once, then any reject-shaped option
+//
+// The allow_always fallback drops the "always" part. An agent that offers no
+// "always" option cannot be told to remember the answer, so the turn is allowed
+// once and the next call asks again. maki always offers all four options, so this
+// only bites a different ACP agent.
 func optionFor(options []permissionOption, decision string) (string, error) {
-	want, kinds := optionAllowOnce, []string{kindAllowOnce, kindAllowAlways}
-	if decision == decisionDeny {
-		want, kinds = optionRejectOnce, []string{kindRejectOnce, kindRejectAlways}
-	} else if decision != decisionAllow {
-		return "", fmt.Errorf("%w: unknown decision %q", errNoOption, decision)
+	switch decision {
+	case decisionAllow:
+		return pickOption(options, optionAllowOnce, kindAllowOnce, kindAllowAlways)
+	case decisionAllowAlways:
+		if id, ok := findOption(options, optionAllowAlways, kindAllowAlways); ok {
+			return id, nil
+		}
+		return pickOption(options, optionAllowOnce, kindAllowOnce)
+	case decisionDeny:
+		return pickOption(options, optionRejectOnce, kindRejectOnce, kindRejectAlways)
 	}
+	return "", fmt.Errorf("%w: unknown decision %q", errNoOption, decision)
+}
+
+// pickOption answers the first option an id or kind names, or the error.
+func pickOption(options []permissionOption, want string, kinds ...string) (string, error) {
+	id, ok := findOption(options, want, kinds...)
+	if !ok {
+		return "", fmt.Errorf("%w: %s", errNoOption, want)
+	}
+	return id, nil
+}
+
+// findOption looks for an exact optionId first, then for any option of these
+// kinds, because a client names what it wants and the agent spells it.
+func findOption(options []permissionOption, want string, kinds ...string) (string, bool) {
 	for _, o := range options {
 		if o.OptionID == want {
-			return o.OptionID, nil
+			return o.OptionID, true
 		}
 	}
 	for _, o := range options {
 		for _, kind := range kinds {
 			if o.Kind == kind {
-				return o.OptionID, nil
+				return o.OptionID, true
 			}
 		}
 	}
-	return "", fmt.Errorf("%w: %s", errNoOption, decision)
+	return "", false
 }
 
 // permissionOption is one entry of `options` in session/request_permission.

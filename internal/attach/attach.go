@@ -41,6 +41,9 @@ const (
 	evDirty    = "dirty"
 	evNotice   = "notice"
 	evSessions = "sessions"
+	// evTasks tells the browser a live tab's task list changed, so it refetches
+	// GET /api/sessions/{id}/tasks (CONTRACTS 2).
+	evTasks = "tasks"
 
 	evPermission       = "permission"
 	evPermissionCancel = "permission_cancel"
@@ -68,6 +71,7 @@ const (
 	opSetTitle  = "set_title"
 	opRespond   = "respond"
 	opPlan      = "plan"
+	opTasks     = "tasks"
 	opPerms     = "permissions"
 	argSession  = "session"
 	argText     = "text"
@@ -80,6 +84,7 @@ const (
 	argDecision = "decision"
 	argGuidance = "guidance"
 	argOn       = "on"
+	argYolo     = "yolo"
 )
 
 // timings are the engine clocks. New uses the contract values; tests shorten
@@ -577,18 +582,23 @@ func (e *Engine) SetTitle(id, title string) error {
 
 // Create opens a background tab in the first live TUI, lowest socket path
 // winning so repeated calls land on one process. m is dropped: the new op takes
-// no model, so the tab keeps that TUI's current model.
-func (e *Engine) Create(cwd, m, prompt string) (string, error) {
+// no model, so the tab keeps that TUI's current model. Yolo travels to the op as
+// `yolo:true`, and the plugin ignores it: a tab of a running TUI cannot skip the
+// permission prompts of a process that was started without it.
+func (e *Engine) Create(req model.CreateRequest) (string, error) {
 	conns := e.live()
 	if len(conns) == 0 {
 		return "", fmt.Errorf("%w: no live tui", model.ErrNotFound)
 	}
 	args := map[string]any{}
-	if cwd != "" {
-		args[argCwd] = cwd
+	if req.Cwd != "" {
+		args[argCwd] = req.Cwd
 	}
-	if prompt != "" {
-		args[argPrompt] = prompt
+	if req.Prompt != "" {
+		args[argPrompt] = req.Prompt
+	}
+	if req.Yolo {
+		args[argYolo] = true
 	}
 	ctx, cancel := e.context()
 	raw, err := conns[0].request(ctx, opNew, args)
@@ -612,10 +622,27 @@ func (e *Engine) Plan(id string) (json.RawMessage, error) {
 	return e.raw(id, opPlan, map[string]any{argSession: id})
 }
 
+// Tasks returns the socket tasks op answer for a live tab, raw JSON of the
+// maki.task.list() rows ({"id","session","name","status","focused",...}). The op
+// takes no session argument, because maki only lists the focused tab's chats, so
+// the id says which TUI to ask and the rows are that TUI's focused tab.
+func (e *Engine) Tasks(id string) (json.RawMessage, error) {
+	return e.raw(id, opTasks, nil)
+}
+
 // RespondPermission answers a parked permission prompt. The plugin request id
 // arrives with the permission event, so the ticket map knows who parked it; a
 // gateway that never saw the event asks everyone.
+//
+// allow_always degrades here rather than in the plugin: the permission.prompt
+// slot a live tab wraps answers allow or deny and nothing else, so the Lua side
+// keeps its binary verdict (lua/gateway/permission.lua) and "always" is dropped.
+// A live tab therefore asks again on the next call, which is the same answer an
+// allow already gives today.
 func (e *Engine) RespondPermission(requestID int64, decision, guidance string) error {
+	if decision == model.DecisionAllowAlways {
+		decision = model.DecisionAllow
+	}
 	args := map[string]any{argRequest: requestID, argDecision: decision}
 	if guidance != "" {
 		args[argGuidance] = guidance

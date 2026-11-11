@@ -66,8 +66,11 @@ func New(makiPath string, hub *model.Hub) *Engine {
 func (e *Engine) Kind() string { return model.KindWeb }
 
 // Create spawns the child, handshakes, and returns the sessionId the agent
-// chose. A non-empty prompt starts the first turn.
-func (e *Engine) Create(cwd, m, prompt string) (string, error) {
+// chose. A non-empty prompt starts the first turn. req.Yolo passes `--yolo` to
+// the child, so it never asks for permission: the browser only sets it when the
+// person asked to create a session that way.
+func (e *Engine) Create(req model.CreateRequest) (string, error) {
+	cwd := req.Cwd
 	// session/new demands an absolute cwd (agent.rs:1225), and the browser can
 	// post none at all, so an empty one means "where the gateway runs".
 	if cwd == "" {
@@ -76,7 +79,7 @@ func (e *Engine) Create(cwd, m, prompt string) (string, error) {
 	if !filepath.IsAbs(cwd) {
 		return "", fmt.Errorf("%w: cwd %q is not absolute", model.ErrUnsupported, cwd)
 	}
-	p, err := spawn(e, cwd, m)
+	p, err := spawn(e, cwd, req.Model, req.Yolo)
 	if err != nil {
 		return "", err
 	}
@@ -84,8 +87,8 @@ func (e *Engine) Create(cwd, m, prompt string) (string, error) {
 	e.procs[p.Session()] = p
 	e.mu.Unlock()
 	p.setStatus(model.StatusIdle)
-	if prompt != "" {
-		if _, err := e.Prompt(p.Session(), prompt); err != nil {
+	if req.Prompt != "" {
+		if _, err := e.Prompt(p.Session(), req.Prompt); err != nil {
 			e.log.Warn("initial prompt failed", "session", p.Session(), "error", err)
 		}
 	}
@@ -261,7 +264,8 @@ func (e *Engine) Kill(id string) error {
 }
 
 // RespondPermission answers a parked session/request_permission with the option
-// id the decision maps to. ACP has no field for guidance, so it is dropped.
+// id the decision maps to (optionFor). ACP has no field for guidance, so it is
+// dropped.
 func (e *Engine) RespondPermission(requestID int64, decision, guidance string) error {
 	e.parkMu.Lock()
 	ask, ok := e.parked[requestID]

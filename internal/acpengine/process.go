@@ -62,9 +62,14 @@ type process struct {
 }
 
 // spawn starts the child and runs the handshake, so the caller gets a session id
-// it can prompt immediately.
-func spawn(eng *Engine, cwd, m string) (*process, error) {
+// it can prompt immediately. yolo adds the subcommand's own `--yolo`: maki reads
+// the permission answer from there and never from the global flag of the same
+// name, so it goes after `acp` (src/cli.rs:428-435, src/cmd/acp.rs:108).
+func spawn(eng *Engine, cwd, m string, yolo bool) (*process, error) {
 	args := []string{argACP}
+	if yolo {
+		args = append(args, argYolo)
+	}
 	if m != "" {
 		args = append(args, argModel, m)
 	}
