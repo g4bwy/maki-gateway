@@ -1,20 +1,23 @@
 package acpengine
 
 import (
-	"bufio"
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+
+	"maki-gateway/internal/acpwire"
 )
 
 // Fake is a stand-in `maki acp` agent. It speaks the same ACP v1 subset written
 // in docs/ACP_MIN.md, so the engine can be tested without a model, an API key,
-// or a network.
+// or a network. It is the codec's second user: the engine drives it as a client,
+// and this side answers as the agent.
 //
 // A prompt text picks what the turn does:
 //
@@ -34,11 +37,10 @@ import (
 // removed on the way, standing for the claim a dying child has not released yet.
 // With the content "always" it keeps answering that way.
 type Fake struct {
+	conn *acpwire.Conn
+
 	mu         sync.Mutex
-	enc        *json.Encoder
-	nextID     int64
-	openPrompt int64
-	answers    chan wireMessage
+	openPrompt *acpwire.Request
 }
 
 // Markers the fake reads. All but the two load markers arrive in prompt text; a
@@ -59,7 +61,7 @@ const (
 	// FakeBusyLoad names the file that makes session/load answer -32000 once,
 	// which is what a session whose previous child has not released its claim
 	// yet looks like to a respawning client. FakeBusyLoadAlways is the file
-	// content that keeps answering that way.
+	// content that keeps refusing.
 	FakeBusyLoad       = "@busyload"
 	FakeBusyLoadAlways = "always"
 
@@ -91,14 +93,15 @@ func recordArgv() {
 	_, _ = f.WriteString(strings.Join(os.Args[1:], "\n") + "\n\n")
 }
 
-// NewFake writes frames to w. r is read by Serve, so it is not kept here.
+// NewFake builds an agent that reads r and writes w. Both live for the life of the
+// process, which is what a child's stdio is.
 func NewFake(r io.Reader, w io.Writer) *Fake {
-	_ = r
-	return &Fake{
-		enc:     json.NewEncoder(w),
-		nextID:  1000, // server.rs:47 FIRST_OUTGOING_REQUEST_ID
-		answers: make(chan wireMessage, 8),
-	}
+	f := &Fake{}
+	f.conn = acpwire.New(transport{r: r, w: w}, acpwire.Options{
+		OnRequest:      f.onRequest,
+		OnNotification: f.onMethod,
+	})
+	return f
 }
 
 // ServeFakeStdio runs the fake on the process stdio. A test binary execed with the
@@ -106,8 +109,7 @@ func NewFake(r io.Reader, w io.Writer) *Fake {
 // a real child process in its tests.
 func ServeFakeStdio() error {
 	recordArgv()
-	f := NewFake(nil, os.Stdout)
-	return f.Serve(os.Stdin)
+	return NewFake(os.Stdin, os.Stdout).Serve()
 }
 
 // IsFakeInvocation reports whether these argv mean "act as the fake agent".
@@ -115,26 +117,22 @@ func IsFakeInvocation(argv []string) bool {
 	return len(argv) > 1 && argv[1] == argACP
 }
 
-// Serve reads frames until its input ends. A child ends when stdin closes, so
+// Serve answers frames until its input ends. A child ends when stdin closes, so
 // io.EOF is a clean return.
-func (f *Fake) Serve(r io.Reader) error {
-	dec := json.NewDecoder(bufio.NewReaderSize(r, 1<<16))
-	for {
-		var m wireMessage
-		if err := dec.Decode(&m); err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-		f.handle(&m)
+func (f *Fake) Serve() error {
+	if err := f.conn.Serve(); err != nil && !errors.Is(err, io.EOF) {
+		return err
 	}
+	return nil
 }
 
-func (f *Fake) handle(m *wireMessage) {
-	switch m.Method {
+// onRequest answers one request the client sent. A prompt is not answered here: it
+// is held until the turn ends, which is the one behaviour of the real server every
+// test depends on.
+func (f *Fake) onRequest(_ context.Context, r *acpwire.Request) error {
+	switch r.Method {
 	case methodInitialize:
-		f.reply(m.ID, map[string]any{
+		return r.Answer(map[string]any{
 			"protocolVersion": acpProtocol,
 			"agentCapabilities": map[string]any{
 				"loadSession":         true,
@@ -146,7 +144,7 @@ func (f *Fake) handle(m *wireMessage) {
 			"agentInfo":   map[string]string{"name": "maki", "version": "fake"},
 		})
 	case methodSessionNew:
-		f.reply(m.ID, map[string]any{
+		return r.Answer(map[string]any{
 			"sessionId": f.sessionID(),
 			"modes": map[string]any{
 				"currentModeId": modeBuild,
@@ -158,40 +156,35 @@ func (f *Fake) handle(m *wireMessage) {
 			"configOptions": []configOption{{ID: optionModel, CurrentValue: "fake/model"}},
 		})
 	case methodSessionPrompt:
-		f.handlePrompt(m)
+		return f.handlePrompt(r)
 	case methodSessionLoad:
-		f.handleLoad(m)
+		return f.handleLoad(r)
 	case methodSessionSetMode:
 		var req struct {
 			SessionID string `json:"sessionId"`
 			ModeID    string `json:"modeId"`
 		}
-		_ = json.Unmarshal(m.Params, &req)
+		_ = json.Unmarshal(r.Params, &req)
 		f.update(req.SessionID, map[string]any{"sessionUpdate": "current_mode_update", "currentModeId": req.ModeID})
-		f.reply(m.ID, map[string]any{})
+		return r.Answer(map[string]any{})
 	case methodSessionSetConfig:
 		var req struct {
 			SessionID string `json:"sessionId"`
 			Value     string `json:"value"`
 		}
-		_ = json.Unmarshal(m.Params, &req)
+		_ = json.Unmarshal(r.Params, &req)
 		options := []configOption{{ID: optionModel, CurrentValue: req.Value}}
 		f.update(req.SessionID, map[string]any{"sessionUpdate": updateConfigOption, "configOptions": options})
-		f.reply(m.ID, map[string]any{"configOptions": options})
-	case methodSessionCancel:
-		f.cancelPrompt()
-	case "":
-		f.collect(*m)
-	default:
-		f.replyError(m.ID, codeMethodNotFound, "method not found")
+		return r.Answer(map[string]any{"configOptions": options})
 	}
+	return r.Fail(acpwire.CodeMethodNotFound, "method not found")
 }
 
-// collect takes the answer to an ask the fake parked.
-func (f *Fake) collect(m wireMessage) {
-	select {
-	case f.answers <- m:
-	default:
+// onMethod takes the notifications the client sends. session/cancel is the only
+// one that changes what a turn does.
+func (f *Fake) onMethod(method string, _ json.RawMessage) {
+	if method == methodSessionCancel {
+		f.cancelPrompt()
 	}
 }
 
@@ -208,7 +201,7 @@ func (f *Fake) sessionID() string {
 // The refusal is asked for by FakeBusyLoad, a file in the session cwd. It is
 // removed as it is read, so the next load of that session succeeds, unless its
 // content is FakeBusyLoadAlways, which keeps refusing.
-func (f *Fake) handleLoad(m *wireMessage) {
+func (f *Fake) handleLoad(r *acpwire.Request) error {
 	var req struct {
 		SessionID  string `json:"sessionId"`
 		Cwd        string `json:"cwd"`
@@ -216,20 +209,18 @@ func (f *Fake) handleLoad(m *wireMessage) {
 	}
 	// sessionId, cwd and mcpServers are all required by the schema
 	// (agent.rs:1401), so a request missing one is a client bug, not a load miss.
-	if err := json.Unmarshal(m.Params, &req); err != nil || req.SessionID == "" || req.MCPServers == nil {
-		f.replyError(m.ID, codeInvalidRequest, "invalid session/load params")
-		return
+	if err := json.Unmarshal(r.Params, &req); err != nil || req.SessionID == "" || req.MCPServers == nil {
+		return r.Fail(codeInvalidRequest, "invalid session/load params")
 	}
 	if held(req.Cwd) {
-		f.replyError(m.ID, codeAuthOrBusy, fakeElsewhereText)
-		return
+		return r.Fail(codeAuthOrBusy, fakeElsewhereText)
 	}
 	// The replay, in the session the client named rather than the one this process
 	// would give itself. A reducer that is not muted for the call appends these to
 	// a transcript that already holds them.
 	f.update(req.SessionID, chunk(updateMessageChunk, fakeReplayText))
 	f.update(req.SessionID, chunk(updateThoughtChunk, fakeReplayText))
-	f.reply(m.ID, map[string]any{
+	return r.Answer(map[string]any{
 		"modes": map[string]any{
 			"currentModeId": modeBuild,
 			"availableModes": []map[string]string{
@@ -257,9 +248,9 @@ func held(cwd string) bool {
 	return true
 }
 
-// handlePrompt mirrors the server: one open id per session, taken under the lock,
-// and the answer only at end of turn.
-func (f *Fake) handlePrompt(m *wireMessage) {
+// handlePrompt mirrors the server: one open request per session, taken under the
+// lock, and the answer only at end of turn.
+func (f *Fake) handlePrompt(r *acpwire.Request) error {
 	var req struct {
 		SessionID string `json:"sessionId"`
 		Prompt    []struct {
@@ -267,23 +258,17 @@ func (f *Fake) handlePrompt(m *wireMessage) {
 			Text string `json:"text"`
 		} `json:"prompt"`
 	}
-	if err := json.Unmarshal(m.Params, &req); err != nil {
-		f.replyError(m.ID, codeInvalidRequest, "invalid params")
-		return
-	}
-	id, err := strconv.ParseInt(string(m.ID), 10, 64)
-	if err != nil {
-		return
+	if err := json.Unmarshal(r.Params, &req); err != nil {
+		return r.Fail(codeInvalidRequest, "invalid params")
 	}
 	f.mu.Lock()
-	busy := f.openPrompt != 0
+	busy := f.openPrompt != nil
 	if !busy {
-		f.openPrompt = id
+		f.openPrompt = r
 	}
 	f.mu.Unlock()
 	if busy {
-		f.replyError(m.ID, codeInternal, fakeRejectDetail)
-		return
+		return r.Fail(codeInternal, fakeRejectDetail)
 	}
 
 	text := ""
@@ -294,41 +279,40 @@ func (f *Fake) handlePrompt(m *wireMessage) {
 	}
 	switch {
 	case strings.Contains(text, FakeExitAsk):
-		// Checked before @exit: its marker string contains it.
-		go func() {
-			f.request(f.nextRequestID(), methodRequestPermission, f.permissionBody(req.SessionID, true))
-			f.wireFlush()
-			os.Exit(fakeExitStatus)
-		}()
+		// Checked before @exit: its marker string contains it. The ask goes out
+		// before the death, because acpwire writes a frame before it returns.
+		if _, err := f.conn.Send(methodRequestPermission, f.permissionBody(req.SessionID, true)); err != nil {
+			return nil
+		}
+		os.Exit(fakeExitStatus)
 	case strings.Contains(text, FakeExit):
 		f.update(req.SessionID, chunk(updateMessageChunk, "leaving"))
 		os.Exit(fakeExitStatus)
 	case strings.Contains(text, FakeReject):
-		f.release(id)
-		f.replyError(m.ID, codeInternal, fakeRejectDetail)
+		f.release(r)
+		return r.Fail(codeInternal, fakeRejectDetail)
 	case strings.Contains(text, FakeElsewhere):
-		f.release(id)
-		f.replyError(m.ID, codeAuthOrBusy, fakeElsewhereText)
+		f.release(r)
+		return r.Fail(codeAuthOrBusy, fakeElsewhereText)
 	case strings.Contains(text, FakeHold):
-		go func() {
-			f.update(req.SessionID, chunk(updateMessageChunk, "held"))
-		}()
+		go f.update(req.SessionID, chunk(updateMessageChunk, "held"))
 	case strings.Contains(text, FakePermission):
-		go f.turnWithPermission(req.SessionID, id,
+		go f.turnWithPermission(req.SessionID, r,
 			!strings.Contains(text, FakeDontAsk), !strings.Contains(text, FakeNoAlways))
 	case strings.Contains(text, FakeAsk):
-		go f.turnWithAsk(req.SessionID, id)
+		go f.turnWithAsk(req.SessionID, r)
 	case strings.Contains(text, FakeGiant):
 		go func() {
 			f.update(req.SessionID, chunk(updateMessageChunk, strings.Repeat("x", 200_000)))
-			f.endTurn(id, "end_turn")
+			f.endTurn(r, "end_turn")
 		}()
 	default:
-		go f.turnPlain(req.SessionID, id)
+		go f.turnPlain(req.SessionID, r)
 	}
+	return nil
 }
 
-func (f *Fake) turnPlain(session string, prompt int64) {
+func (f *Fake) turnPlain(session string, prompt *acpwire.Request) {
 	f.update(session, chunk(updateThoughtChunk, "pondering"))
 	f.update(session, chunk(updateMessageChunk, "hello "))
 	f.update(session, chunk(updateMessageChunk, "world"))
@@ -365,15 +349,26 @@ func (f *Fake) turnPlain(session string, prompt int64) {
 // turnWithPermission asks, waits for the answer, then streams what was picked so
 // a test can read the option id back out of the transcript. An ask the client
 // never answers leaves the turn open, which is what the die path is for.
-func (f *Fake) turnWithPermission(session string, prompt int64, ask, always bool) {
+func (f *Fake) turnWithPermission(session string, prompt *acpwire.Request, ask, always bool) {
 	if !ask {
 		f.update(session, chunk(updateMessageChunk, "never asked"))
 		f.endTurn(prompt, "end_turn")
 		return
 	}
-	f.request(f.nextRequestID(), methodRequestPermission, f.permissionBody(session, always))
-	answer := <-f.answers
-	chosen := outcomeCancelled
+	chosen := f.askPermission(session, always)
+	f.update(session, chunk(updateMessageChunk, "option:"+chosen))
+	f.endTurn(prompt, "end_turn")
+}
+
+// askPermission parks a session/request_permission and reports the option id the
+// client picked. A cancelled outcome comes back as its own name, which is what the
+// transcript of a withdrawn dialog shows.
+func (f *Fake) askPermission(session string, always bool) string {
+	call, err := f.conn.Send(methodRequestPermission, f.permissionBody(session, always))
+	if err != nil {
+		return outcomeCancelled
+	}
+	answer := <-call.Resp
 	var res struct {
 		Outcome struct {
 			Outcome  string `json:"outcome"`
@@ -381,14 +376,20 @@ func (f *Fake) turnWithPermission(session string, prompt int64, ask, always bool
 		} `json:"outcome"`
 	}
 	if json.Unmarshal(answer.Result, &res) == nil && res.Outcome.Outcome == outcomeSelected {
-		chosen = res.Outcome.OptionID
+		return res.Outcome.OptionID
 	}
-	f.update(session, chunk(updateMessageChunk, "option:"+chosen))
+	return outcomeCancelled
+}
+
+func (f *Fake) turnWithAsk(session string, prompt *acpwire.Request) {
+	action := f.askForm(session)
+	f.update(session, chunk(updateMessageChunk, "action:"+action))
 	f.endTurn(prompt, "end_turn")
 }
 
-func (f *Fake) turnWithAsk(session string, prompt int64) {
-	f.request(f.nextRequestID(), methodElicitationCreate, map[string]any{
+// askForm parks an elicitation/create and reports the action that answered it.
+func (f *Fake) askForm(session string) string {
+	call, err := f.conn.Send(methodElicitationCreate, map[string]any{
 		"mode":      "form",
 		"sessionId": session,
 		"requestedSchema": map[string]any{
@@ -397,22 +398,23 @@ func (f *Fake) turnWithAsk(session string, prompt int64) {
 		},
 		"message": "Pick one",
 	})
-	answer := <-f.answers
-	action := "none"
+	if err != nil {
+		return "none"
+	}
+	answer := <-call.Resp
 	var res struct {
 		Action string `json:"action"`
 	}
 	if json.Unmarshal(answer.Result, &res) == nil && res.Action != "" {
-		action = res.Action
+		return res.Action
 	}
-	f.update(session, chunk(updateMessageChunk, "action:"+action))
-	f.endTurn(prompt, "end_turn")
+	return "none"
 }
 
 // endTurn answers the prompt the way the real server does: at end of turn.
-func (f *Fake) endTurn(prompt int64, reason string) {
+func (f *Fake) endTurn(prompt *acpwire.Request, reason string) {
 	f.release(prompt)
-	f.reply(json.RawMessage(fmt.Sprintf("%d", prompt)), map[string]any{"stopReason": reason})
+	_ = prompt.Answer(map[string]any{"stopReason": reason})
 }
 
 // cancelPrompt answers an open prompt with the cancelled stop reason, like a turn
@@ -421,15 +423,15 @@ func (f *Fake) cancelPrompt() {
 	f.mu.Lock()
 	prompt := f.openPrompt
 	f.mu.Unlock()
-	if prompt != 0 {
+	if prompt != nil {
 		f.endTurn(prompt, outcomeCancelled)
 	}
 }
 
-func (f *Fake) release(prompt int64) {
+func (f *Fake) release(prompt *acpwire.Request) {
 	f.mu.Lock()
 	if f.openPrompt == prompt {
-		f.openPrompt = 0
+		f.openPrompt = nil
 	}
 	f.mu.Unlock()
 }
@@ -462,13 +464,6 @@ func (f *Fake) permissionBody(session string, always bool) map[string]any {
 	}
 }
 
-// wireFlush is a no-op barrier: every frame is written under the same lock, so
-// taking it means earlier frames reached the pipe already.
-func (f *Fake) wireFlush() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-}
-
 func chunk(update, text string) map[string]any {
 	return map[string]any{
 		"sessionUpdate": update,
@@ -476,40 +471,7 @@ func chunk(update, text string) map[string]any {
 	}
 }
 
-func (f *Fake) nextRequestID() json.RawMessage {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	id := f.nextID
-	f.nextID++
-	return json.RawMessage(strconv.FormatInt(id, 10))
-}
-
-func (f *Fake) reply(rawID json.RawMessage, result any) {
-	f.wire(map[string]any{"jsonrpc": jsonrpcVersion, "id": rawID, "result": result})
-}
-
-func (f *Fake) replyError(rawID json.RawMessage, code int, message string) {
-	f.wire(map[string]any{
-		"jsonrpc": jsonrpcVersion,
-		"id":      rawID,
-		"error":   map[string]any{"code": code, "message": message},
-	})
-}
-
-func (f *Fake) request(rawID json.RawMessage, method string, params any) {
-	f.wire(map[string]any{"jsonrpc": jsonrpcVersion, "id": rawID, "method": method, "params": params})
-}
-
+// update pushes one session/update notification.
 func (f *Fake) update(session string, update map[string]any) {
-	f.wire(wireRequest{
-		JSONRPC: jsonrpcVersion,
-		Method:  methodSessionUpdate,
-		Params:  map[string]any{"sessionId": session, "update": update},
-	})
-}
-
-func (f *Fake) wire(frame any) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_ = f.enc.Encode(frame)
+	_ = f.conn.Notify(methodSessionUpdate, map[string]any{"sessionId": session, "update": update})
 }

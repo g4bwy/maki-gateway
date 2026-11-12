@@ -7,6 +7,10 @@ in `internal/model/types.go`; do not change its signatures silently.
 
 ## 1. Attach socket protocol (maki Lua plugin <-> gateway)
 
+**Superseded for new work by `docs/WIRE.md`, the frozen v2 spec (ACP subset on the same
+socket).** This section stays as the record of what a plugin running on a box speaks today, and
+the error words in it are still what the gateway maps. Read both before you change either side.
+
 Transport: unix socket, newline-delimited JSON. No other framing. Plugin path:
 `$MAKI_GATEWAY_SOCK` if set, else `$XDG_STATE_HOME/maki/gateway/pid-<pid>.sock` (default state
 home `~/.local/state/maki`). Socket mode 0600. Gateway discovery: scan that dir, connect each,

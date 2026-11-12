@@ -9,7 +9,6 @@
 package acpengine
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"maki-gateway/internal/acpwire"
 	"maki-gateway/internal/model"
 )
 
@@ -51,12 +51,12 @@ type Engine struct {
 }
 
 // parkedAsk is one agent->client permission request this side still owes an
-// answer to. The JSON-RPC id is kept raw: it is a number today but the schema
-// allows a string (server.rs:880). id is what this engine publishes, so the two
-// ids must travel together.
+// answer to. The Request is the codec's own handle: it carries the JSON-RPC id,
+// which may be a number or a string (server.rs:880), and answers once. id is what
+// this engine publishes, so the two ids must travel together.
 type parkedAsk struct {
 	id      int64
-	raw     json.RawMessage
+	req     *acpwire.Request
 	proc    *process
 	session string
 	options []permissionOption
@@ -141,7 +141,7 @@ func (e *Engine) Messages(id string, last int) ([]model.Message, error) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.tr.msgs) == 0 && p.exited {
+	if len(p.tr.msgs) == 0 && p.isExited() {
 		return nil, fmt.Errorf("%w: %s", model.ErrNotFound, id)
 	}
 	return p.tr.tail(last), nil
@@ -158,13 +158,13 @@ func (e *Engine) Prompt(id, text string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ch, err := p.beginPrompt(text)
+	call, err := p.beginPrompt(text)
 	if err != nil {
 		return "", err
 	}
 	p.setStatus(model.StatusWorking)
 	done := make(chan error, 1)
-	go func() { done <- p.endPrompt(<-ch) }()
+	go func() { done <- p.endPrompt(<-call.Resp) }()
 	select {
 	case err := <-done:
 		// Losing the child after the frame went out is not a rejection. The
@@ -196,7 +196,7 @@ func (e *Engine) Cancel(id string) error {
 // id to echo and the agent would stay parked.
 func (e *Engine) withdrawAsks(p *process) {
 	for _, ask := range e.takeAll(p.Session()) {
-		_ = p.respond(ask.raw, map[string]any{"outcome": map[string]string{"outcome": outcomeCancelled}})
+		_ = ask.req.Answer(map[string]any{"outcome": map[string]string{"outcome": outcomeCancelled}})
 		e.hub.Publish(model.Event{
 			Type:      "permission_cancel",
 			Engine:    model.EngineACP,
@@ -396,10 +396,10 @@ func (e *Engine) RespondPermission(requestID int64, decision, guidance string) e
 		e.parkMu.Unlock()
 		return err
 	}
-	if err := ask.proc.respond(ask.raw, map[string]any{
+	if err := ask.req.Answer(map[string]any{
 		"outcome": map[string]any{"outcome": outcomeSelected, "optionId": option},
 	}); err != nil {
-		return err
+		return mapError(err)
 	}
 	ask.proc.resumeAfterAsk()
 	return nil
@@ -429,12 +429,12 @@ func (e *Engine) live(id string) (*process, error) {
 
 // park records an open ask and returns the id this engine publishes for it.
 // Ids are per-engine counters, never the agent's, so two children that both
-// start at 1000 cannot answer each other.
-func (e *Engine) park(p *process, session string, raw json.RawMessage, options []permissionOption) int64 {
+// start at 1 cannot answer each other.
+func (e *Engine) park(p *process, session string, req *acpwire.Request, options []permissionOption) int64 {
 	e.parkMu.Lock()
 	defer e.parkMu.Unlock()
 	e.parkID++
-	e.parked[e.parkID] = &parkedAsk{id: e.parkID, raw: raw, proc: p, session: session, options: options}
+	e.parked[e.parkID] = &parkedAsk{id: e.parkID, req: req, proc: p, session: session, options: options}
 	return e.parkID
 }
 
@@ -457,7 +457,7 @@ func (p *process) resumeAfterAsk() {
 func (p *process) entry() (model.Session, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.session == "" || (p.exited && !p.restarting) {
+	if p.session == "" || (p.isExited() && !p.restarting) {
 		return model.Session{}, false
 	}
 	return model.Session{

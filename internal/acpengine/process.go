@@ -2,17 +2,19 @@ package acpengine
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"maki-gateway/internal/acpwire"
 	"maki-gateway/internal/model"
 )
 
@@ -65,16 +67,18 @@ type process struct {
 
 	wmu    sync.Mutex
 	stdin  io.WriteCloser
-	enc    *json.Encoder
 	closed bool
+
+	// wire is the connection of the child this record talks to now, and nil
+	// before the first one. A pointer rather than a field under mu because the
+	// list row reads it while holding mu and every call path takes wmu: a lock
+	// here would invert that order. A yolo toggle replaces it with install.
+	wire atomic.Pointer[acpwire.Conn]
 
 	mu         sync.Mutex
 	cmd        *exec.Cmd
-	seq        int64
-	calls      map[int64]chan wireMessage
 	tr         *transcript
 	busy       bool
-	exited     bool
 	restarting bool
 	// loading mutes the transcript reducer and the update passthrough while a
 	// respawn replays the stored history. See reload.
@@ -91,7 +95,6 @@ type process struct {
 func spawn(eng *Engine, cwd, m string, yolo bool) (*process, error) {
 	p := &process{
 		eng:       eng,
-		calls:     map[int64]chan wireMessage{},
 		tr:        newTranscript(),
 		cwd:       cwd,
 		modelSpec: m,
@@ -103,10 +106,10 @@ func spawn(eng *Engine, cwd, m string, yolo bool) (*process, error) {
 		return nil, err
 	}
 	p.log = eng.log.With("pid", c.cmd.Process.Pid)
-	p.install(c)
+	conn := p.install(c)
 	p.touch()
 	go p.pumpStderr(c.stderr)
-	go p.readLoop(c.stdout)
+	conn.Start()
 	if err := p.handshake(); err != nil {
 		p.stop()
 		return nil, err
@@ -143,6 +146,17 @@ type child struct {
 	stderr io.ReadCloser
 }
 
+// transport is one child's stdio seen as a single byte stream, which is all
+// acpwire asks of a transport. It has no Close on purpose: the gateway ends a
+// child by closing its input, and the codec must not do that behind its back.
+type transport struct {
+	r io.Reader
+	w io.Writer
+}
+
+func (t transport) Read(p []byte) (int, error)  { return t.r.Read(p) }
+func (t transport) Write(p []byte) (int, error) { return t.w.Write(p) }
+
 // launch starts a child without touching the session record, so its pipes reach
 // the pump goroutines only once the record is ready to hand over the wire.
 func launch(makiPath, cwd string, args []string) (*child, error) {
@@ -168,20 +182,30 @@ func launch(makiPath, cwd string, args []string) (*child, error) {
 
 // install makes a freshly launched child the one this record talks to. The record
 // keeps everything else: transcript cache, session id, title, model. Nothing of
-// the old child is still owed an answer, because die failed every open request
-// when its stdout closed, and a respawn waits for that.
-func (p *process) install(c *child) {
+// the old child is still owed an answer, because its connection failed every open
+// request when its stdout closed, and a respawn waits for that.
+func (p *process) install(c *child) *acpwire.Conn {
+	conn := acpwire.New(transport{r: c.stdout, w: c.stdin}, acpwire.Options{
+		// The death frame keeps the marker name a caller reads a lost child by,
+		// so a request that raced the exit answers the same as a closed one.
+		Death:          &wireError{Code: codeGone, Message: "process exited"},
+		Logger:         p.log,
+		OnRequest:      p.onAsk,
+		OnNotification: p.onNote,
+		OnClose:        p.die,
+	})
+
 	p.mu.Lock()
 	p.cmd = c.cmd
-	p.calls = map[int64]chan wireMessage{}
-	p.exited = false
 	p.mu.Unlock()
 
 	p.wmu.Lock()
 	p.stdin = c.stdin
-	p.enc = json.NewEncoder(c.stdin)
 	p.closed = false
 	p.wmu.Unlock()
+
+	p.wire.Store(conn)
+	return conn
 }
 
 // respawnChild starts the next child of this session, asked to answer permissions
@@ -194,10 +218,10 @@ func (p *process) respawnChild(yolo bool) error {
 	if err != nil {
 		return err
 	}
-	p.install(c)
+	conn := p.install(c)
 	p.log.Info("acp child respawned", "pid", c.cmd.Process.Pid, "yolo", yolo)
 	go p.pumpStderr(c.stderr)
-	go p.readLoop(c.stdout)
+	conn.Start()
 	// Second half of the Kill check: it can also land between install and here, and
 	// then this child was started for a session nothing owns. The pumps are already
 	// running, so ending it reaps it like any other death.
@@ -292,122 +316,77 @@ func (p *process) reload() error {
 	return nil
 }
 
-// call sends a request and waits for its answer.
+// call sends a request and waits for its answer, no longer than timeout.
 func (p *process) call(method string, params any, timeout time.Duration) (json.RawMessage, error) {
-	key, ch, err := p.request(method, params)
+	conn, err := p.link()
 	if err != nil {
 		return nil, err
 	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case m := <-ch:
-		return m.result()
-	case <-timer.C:
-		p.forget(key)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	raw, err := conn.Call(ctx, method, params)
+	if errors.Is(err, context.DeadlineExceeded) {
 		return nil, errTimeout
 	}
+	return raw, mapError(err)
 }
 
-// request registers a pending call and writes its frame. session/prompt answers
-// only at end of turn, so that caller waits on the channel instead of here.
-func (p *process) request(method string, params any) (int64, chan wireMessage, error) {
-	p.mu.Lock()
-	if p.exited {
-		p.mu.Unlock()
-		return 0, nil, errGone
+// begin writes a request whose answer the caller waits for itself. session/prompt
+// answers only at end of turn, so its owner reads Call.Resp instead of blocking
+// here.
+func (p *process) begin(method string, params any) (*acpwire.Call, error) {
+	conn, err := p.link()
+	if err != nil {
+		return nil, err
 	}
-	p.seq++
-	key := p.seq
-	ch := make(chan wireMessage, 1)
-	p.calls[key] = ch
-	frame := wireRequest{JSONRPC: jsonrpcVersion, ID: json.RawMessage(strconv.FormatInt(key, 10)), Method: method, Params: params}
-	p.mu.Unlock()
-
-	if err := p.send(frame); err != nil {
-		p.forget(key)
-		return 0, nil, err
+	call, err := conn.Send(method, params)
+	if err != nil {
+		return nil, mapError(err)
 	}
-	return key, ch, nil
-}
-
-func (p *process) forget(key int64) {
-	p.mu.Lock()
-	delete(p.calls, key)
-	p.mu.Unlock()
+	return call, nil
 }
 
 func (p *process) notify(method string, params any) error {
-	return p.send(wireRequest{JSONRPC: jsonrpcVersion, Method: method, Params: params})
+	conn, err := p.link()
+	if err != nil {
+		return err
+	}
+	return mapError(conn.Notify(method, params))
 }
 
-func (p *process) send(frame any) error {
+// link is the connection to talk on. A record whose input is closed or whose child
+// stopped answering has no connection left to use, so a call on it reports the
+// session as gone rather than faulting this one request.
+func (p *process) link() (*acpwire.Conn, error) {
 	p.wmu.Lock()
 	defer p.wmu.Unlock()
-	if p.closed {
-		return errGone
+	conn := p.wire.Load()
+	if p.closed || conn == nil || conn.Closed() {
+		return nil, errGone
 	}
-	return p.enc.Encode(frame)
+	return conn, nil
 }
 
-// respond answers an agent->client request, echoing its raw id. server.rs:851
-// reads `id` plus either `result` or `error` off the frame.
-func (p *process) respond(rawID json.RawMessage, result any) error {
-	return p.send(map[string]any{"jsonrpc": jsonrpcVersion, "id": rawID, "result": result})
-}
-
-func (p *process) respondError(rawID json.RawMessage, code int, message string) error {
-	return p.send(map[string]any{
-		"jsonrpc": jsonrpcVersion,
-		"id":      rawID,
-		"error":   map[string]any{"code": code, "message": message},
-	})
-}
-
-// readLoop decodes the stdout stream. A json.Decoder is used rather than a line
-// scanner because one tool result can outgrow a 64 KiB line cap.
-func (p *process) readLoop(r io.Reader) {
-	dec := json.NewDecoder(bufio.NewReaderSize(r, 1<<16))
-	for {
-		var m wireMessage
-		if err := dec.Decode(&m); err != nil {
-			p.die(err)
-			return
-		}
-		p.dispatch(&m)
+// onNote forwards the one notification stream the server pushes. A method with no
+// meaning here is dropped rather than treated as a fault: an agent may announce
+// anything, and the gateway passes on what the browser can use.
+func (p *process) onNote(method string, params json.RawMessage) {
+	if method == methodSessionUpdate {
+		p.handleUpdate(params)
 	}
 }
 
-func (p *process) dispatch(m *wireMessage) {
-	switch m.kind() {
-	case "response":
-		p.answer(m)
-	case "request":
-		p.handleAsk(m)
-	default:
-		if m.Method == methodSessionUpdate {
-			p.handleUpdate(m.Params)
-		}
+// onAsk answers the agent->client requests the server can send. Anything else is
+// refused on the spot, so the child never waits on an ask nobody read.
+func (p *process) onAsk(_ context.Context, r *acpwire.Request) error {
+	switch r.Method {
+	case methodRequestPermission:
+		return p.askPermission(r)
+	case methodElicitationCreate:
+		return p.askElicitation(r)
 	}
-}
-
-// answer hands a response to whoever sent its request. Ids this side sends are
-// always numbers, so anything else has no owner here.
-func (p *process) answer(m *wireMessage) {
-	var key int64
-	if err := json.Unmarshal(m.ID, &key); err != nil {
-		p.logger().Debug("response with an unreadable id", "id", string(m.ID))
-		return
-	}
-	p.mu.Lock()
-	ch, ok := p.calls[key]
-	delete(p.calls, key)
-	p.mu.Unlock()
-	if !ok {
-		p.logger().Debug("response for a forgotten request id", "id", key)
-		return
-	}
-	ch <- *m
+	p.logger().Debug("unhandled agent request", "method", r.Method)
+	return &wireError{Code: codeMethodNotFound, Message: "method not found"}
 }
 
 func (p *process) handleUpdate(params json.RawMessage) {
@@ -473,28 +452,16 @@ func (p *process) note(raw json.RawMessage) {
 	}
 }
 
-// handleAsk answers the two agent->client requests the server can send.
-func (p *process) handleAsk(m *wireMessage) {
-	switch m.Method {
-	case methodRequestPermission:
-		p.askPermission(m)
-	case methodElicitationCreate:
-		p.askElicitation(m)
-	default:
-		p.logger().Debug("unhandled agent request", "method", m.Method)
-		_ = p.respondError(m.ID, codeMethodNotFound, "method not found")
-	}
-}
-
-func (p *process) askPermission(m *wireMessage) {
+// askPermission parks a session/request_permission for the browser to answer. The
+// ask stays unanswered until someone replies, which is what the child waits on.
+func (p *process) askPermission(r *acpwire.Request) error {
 	var req permissionRequest
-	if err := json.Unmarshal(m.Params, &req); err != nil {
+	if err := json.Unmarshal(r.Params, &req); err != nil {
 		p.logger().Debug("bad request_permission", "error", err)
-		_ = p.respondError(m.ID, codeInvalidRequest, "invalid params")
-		return
+		return &wireError{Code: codeInvalidRequest, Message: "invalid params"}
 	}
 	id := p.Session()
-	requestID := p.eng.park(p, id, m.ID, req.Options)
+	requestID := p.eng.park(p, id, r, req.Options)
 	p.setStatus(model.StatusNeedsInput)
 	p.logger().Debug("parked permission", "request_id", requestID, "tool", req.ToolCall.Title)
 	p.eng.hub.Publish(model.Event{
@@ -505,13 +472,14 @@ func (p *process) askPermission(m *wireMessage) {
 		Tool:      req.ToolCall.Title,
 		Input:     req.ToolCall.RawInput,
 	})
+	return nil
 }
 
-func (p *process) askElicitation(m *wireMessage) {
-	// No web form exists yet, so dismiss the ask the way a closed dialog reads.
-	// elicitation.rs:130 turns any action other than "accept" into its DISMISSED
-	// text, and "cancel" is the spelling its own test at elicitation.rs:255 uses.
-	if err := p.respond(m.ID, map[string]string{"action": actionCancel}); err != nil {
+// askElicitation dismisses an ask this side has no form for.
+// elicitation.rs:130 turns any action other than "accept" into its DISMISSED text,
+// and "cancel" is the spelling its own test at elicitation.rs:255 uses.
+func (p *process) askElicitation(r *acpwire.Request) error {
+	if err := r.Answer(map[string]string{"action": actionCancel}); err != nil {
 		p.logger().Debug("elicitation cancel failed", "error", err)
 	}
 	p.eng.hub.Publish(model.Event{
@@ -520,6 +488,7 @@ func (p *process) askElicitation(m *wireMessage) {
 		Session: p.Session(),
 		Text:    noticeQuestion,
 	})
+	return nil
 }
 
 // pumpStderr keeps child noise out of the gateway's own stderr.
@@ -543,31 +512,18 @@ func trimEnd(s string) string {
 	return s
 }
 
-// die runs once when stdout closes. It fails every open request, drops parked
-// asks, and publishes exit. There is no ping and no restart.
+// die runs once when the child's stdout ends, reported by its connection. It drops
+// parked asks and publishes exit. There is no ping and no restart: an open request
+// was already failed by the connection when the stream stopped.
 func (p *process) die(readErr error) {
 	p.mu.Lock()
-	if p.exited {
-		p.mu.Unlock()
-		return
-	}
-	p.exited = true
 	p.busy = false
 	// The handle is taken here, not read later: a respawn swaps p.cmd once this
 	// record is marked gone, and waiting on the wrong child would reap the new one.
 	cmd := p.cmd
-	waiting := make([]chan wireMessage, 0, len(p.calls))
-	for key, ch := range p.calls {
-		waiting = append(waiting, ch)
-		delete(p.calls, key)
-	}
 	id := p.session
 	p.mu.Unlock()
 
-	gone := wireMessage{Error: &wireError{Code: codeGone, Message: "process exited"}}
-	for _, ch := range waiting {
-		ch <- gone
-	}
 	for _, ask := range p.eng.takeAll(id) {
 		p.eng.hub.Publish(model.Event{
 			Type:      "permission_cancel",
@@ -652,7 +608,7 @@ func (p *process) handle() *exec.Cmd {
 	return p.cmd
 }
 
-// exitedWithin waits for the die path to report the child gone.
+// exitedWithin waits for the child's connection to report the stream ended.
 func (p *process) exitedWithin(d time.Duration) bool {
 	deadline := time.Now().Add(d)
 	for {
@@ -719,10 +675,12 @@ func (p *process) setPermissionAnswer(on bool) {
 	p.mu.Unlock()
 }
 
+// isExited reports that this record has no live child: no connection yet, or one
+// whose stream ended. The connection owns that fact, so a respawn that arms a new
+// child is live again without any bookkeeping here.
 func (p *process) isExited() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.exited
+	conn := p.wire.Load()
+	return conn == nil || conn.Closed()
 }
 
 func (p *process) Session() string {
@@ -770,14 +728,10 @@ func (p *process) name() string {
 }
 
 // beginPrompt takes the one open turn this process may have and writes the
-// request. The answer lands at end of turn, so the caller owns the channel.
-func (p *process) beginPrompt(text string) (chan wireMessage, error) {
+// request. The answer lands at end of turn, so the caller owns the call.
+func (p *process) beginPrompt(text string) (*acpwire.Call, error) {
 	p.mu.Lock()
-	switch {
-	case p.exited:
-		p.mu.Unlock()
-		return nil, errGone
-	case p.busy:
+	if p.busy {
 		p.mu.Unlock()
 		return nil, model.ErrBusy
 	}
@@ -786,7 +740,7 @@ func (p *process) beginPrompt(text string) (chan wireMessage, error) {
 	session := p.session
 	p.mu.Unlock()
 
-	_, ch, err := p.request(methodSessionPrompt, map[string]any{
+	call, err := p.begin(methodSessionPrompt, map[string]any{
 		"sessionId": session,
 		"prompt":    []map[string]string{{"type": blockText, "text": text}},
 	})
@@ -796,7 +750,7 @@ func (p *process) beginPrompt(text string) (chan wireMessage, error) {
 		p.mu.Unlock()
 		return nil, err
 	}
-	return ch, nil
+	return call, nil
 }
 
 // endPrompt releases the turn and reports how the agent answered it. A failed
@@ -807,7 +761,7 @@ func (p *process) endPrompt(m wireMessage) error {
 	p.mu.Lock()
 	p.busy = false
 	p.mu.Unlock()
-	_, err := m.result()
+	_, err := payload(&m)
 	if m.Error != nil && m.Error.Code != codeGone {
 		p.logger().Warn("turn answered with an error", "error", err)
 		p.eng.hub.Publish(model.Event{

@@ -6,14 +6,16 @@ import (
 	"fmt"
 	"strings"
 
+	"maki-gateway/internal/acpwire"
 	"maki-gateway/internal/model"
 )
 
 // Wire constants. Every name here is quoted from the Rust server in
-// /home/gab/test/maki/maki-acp/src with the file:line in docs/ACP_MIN.md.
+// /home/gab/test/maki/maki-acp/src with the file:line in docs/ACP_MIN.md. Framing,
+// id rules, and the error object come from internal/acpwire, which this engine and
+// the attach bridge share.
 const (
-	jsonrpcVersion = "2.0"
-	acpProtocol    = 1
+	acpProtocol = 1
 
 	methodInitialize        = "initialize"
 	methodSessionNew        = "session/new"
@@ -69,9 +71,9 @@ const (
 	noticeQuestion = "question asked; answer in terminal"
 
 	// JSON-RPC codes the server answers with (docs/ACP_MIN.md).
-	codeInvalidRequest = -32600
-	codeMethodNotFound = -32601
-	codeInternal       = -32603
+	codeInvalidRequest = acpwire.CodeInvalidRequest
+	codeMethodNotFound = acpwire.CodeMethodNotFound
+	codeInternal       = acpwire.CodeInternal
 	codeAuthOrBusy     = -32000
 
 	// codeNotFound is the schema's resource_not_found: the agent has no session
@@ -92,54 +94,34 @@ const (
 	argYolo = "--yolo"
 )
 
-// wireRequest is one outgoing frame. A nil ID makes it a notification.
-type wireRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method"`
-	Params  any             `json:"params,omitempty"`
+// The two codec shapes this package names. Both belong to acpwire: a frame is a
+// frame whether it came from a child on stdio or from a plugin on a socket.
+type (
+	wireMessage = acpwire.Msg
+	wireError   = acpwire.Error
+)
+
+// payload is the answer of a response frame, in the gateway's own error words.
+func payload(m *wireMessage) (json.RawMessage, error) {
+	raw, err := m.Payload()
+	return raw, mapError(err)
 }
 
-// wireMessage is any incoming frame: request, notification, or response.
-type wireMessage struct {
-	ID     json.RawMessage `json:"id"`
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
-	Result json.RawMessage `json:"result"`
-	Error  *wireError      `json:"error"`
-}
-
-type wireError struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data,omitempty"`
-}
-
-func (e *wireError) Error() string {
-	if len(e.Data) > 0 {
-		return fmt.Sprintf("acp error %d: %s (%s)", e.Code, e.Message, e.Data)
-	}
-	return fmt.Sprintf("acp error %d: %s", e.Code, e.Message)
-}
-
-// kind reports whether the frame answers a request, asks one, or announces one.
-func (m *wireMessage) kind() string {
+// mapError turns one codec error into what CONTRACTS 2 says the caller hears. An
+// error that is not a wire error is a fault of this connection rather than an
+// answer, and errGone is the only one of those a caller can act on.
+func mapError(err error) error {
+	var we *wireError
 	switch {
-	case m.Method == "" && (len(m.Result) > 0 || m.Error != nil):
-		return "response"
-	case m.Method != "" && len(m.ID) > 0 && string(m.ID) != "null":
-		return "request"
+	case err == nil:
+		return nil
+	case errors.As(err, &we):
+		return mapWireError(we)
+	case errors.Is(err, acpwire.ErrClosed):
+		return errGone
 	default:
-		return "notification"
+		return err
 	}
-}
-
-// result returns the payload of a response, or its mapped error.
-func (m *wireMessage) result() (json.RawMessage, error) {
-	if m.Error != nil {
-		return nil, mapWireError(m.Error)
-	}
-	return m.Result, nil
 }
 
 // mapWireError turns an ACP error into the gateway errors CONTRACTS 2 defines.
