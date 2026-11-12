@@ -1,13 +1,18 @@
 -- The permission bridge: answer a tool permission prompt from the gateway.
 --
 -- `permission.prompt` fires where the human prompt would show, and a layer may
--- park, so this wrapper publishes a `permission` event, waits for the matching
--- `respond`, and otherwise hands the call back to the terminal prompt. The
--- host gives a layer 60 seconds before it stops listening, so the wait stops at
--- 55 and names the withdrawal on the wire.
+-- park, so this wrapper raises one native `session/request_permission` per
+-- connection that finished the handshake, waits for the first answer, and lets
+-- the terminal prompt take the call when nobody answered in time. The host gives
+-- a layer 60 seconds before it stops listening, so the wait stops at 55.
 --
--- Every wait is a `maki.async.sleep`, which yields the shared Lua thread. No
--- lock is held here, and no state is kept outside these two module tables.
+-- The bridge is on while a client is connected (WIRE 10.4). v1's `permissions` op
+-- and its `respond` op are gone: the ask is a request this side sends, and its
+-- answer is the JSON-RPC answer to that request.
+--
+-- Every wait is a `maki.async.sleep`, which yields this task and no other. No
+-- lock is held here, and the only state is the ask record conns.lua routes
+-- answers into.
 
 local protocol = require("gateway.protocol")
 local conns = require("gateway.conns")
@@ -16,15 +21,34 @@ local M = {}
 
 local POLL_MS = 500
 local PERMISSION_WAIT_MS = 55000
-local EXPIRED = "expired"
+local ALLOW = "allow_once"
+local REJECT = "reject_once"
+local SELECTED = "selected"
+local GUIDANCE_KEY = "sh.maki/guidance"
+local METHOD = "session/request_permission"
+-- The host slot answers two ways and a browser dialog has two buttons, so the
+-- option list holds exactly these two, in this order (WIRE 10). The slot cannot
+-- say "remember this", so nothing else belongs on the list.
+local OPTIONS = {
+  { optionId = ALLOW, name = "Allow once", kind = "allow_once" },
+  { optionId = REJECT, name = "Reject once", kind = "reject_once" },
+}
+-- The withdrawal of WIRE 10.2. Read-only: one table goes to every connection.
+local CANCELLED = { outcome = { outcome = "cancelled" } }
 
-local bridge_on = false
-local counter = 0
-local pending = {}
+--- The tab on screen, or "" when the host answers nothing.
+local function focused_session()
+  local called, id = pcall(maki.session.current)
+  if not called then
+    return ""
+  end
+  return protocol.str(id)
+end
 
---- Whose call it is. ctx is the agent ctx, then the focused tab, then "".
-local function session_id(ctx)
-  if ctx then
+--- Whose call it is. The ctx of a tool names its own session, which is not always
+--- the tab on screen: a subagent's call belongs to its parent tab.
+local function session_of(ctx)
+  if ctx ~= nil then
     local called, id = pcall(function()
       return ctx:session_id()
     end)
@@ -32,79 +56,114 @@ local function session_id(ctx)
       return protocol.str(id)
     end
   end
-  local current = maki.session.current()
-  return protocol.str(current)
+  return focused_session()
 end
 
-function M.set_enabled(on)
-  bridge_on = on and true or false
-  maki.log.info("gateway: permission bridge " .. (bridge_on and "on" or "off"))
-  return true
-end
-
-function M.is_enabled()
-  return bridge_on
-end
-
---- Answer a `permission` event. request_id is the one the event carried.
-function M.respond(request_id, decision, guidance)
-  if type(request_id) ~= "number" then
-    return nil, "request_id must be a number"
+--- The line the terminal shows, built the way `maki acp` builds it: the tool name
+--- and the scopes it asked about (WIRE 10).
+local function scope_line(req)
+  local tool = protocol.str(req and req.tool, "tool")
+  local scopes = {}
+  local given = req and req.scopes
+  if type(given) == "table" then
+    for _, scope in ipairs(given) do
+      scopes[#scopes + 1] = protocol.str(scope)
+    end
   end
-  if decision ~= "allow" and decision ~= "deny" then
-    return nil, "decision must be allow or deny"
+  if #scopes == 0 then
+    return tool
   end
-  local entry = pending[math.floor(request_id)]
-  if not entry or entry.answer or entry.timed_out then
-    return nil, EXPIRED
-  end
-  entry.answer = { decision = decision, guidance = guidance }
-  return true
+  return tool .. ": " .. table.concat(scopes, ", ")
 end
 
---- The layer for the `permission.prompt` slot. Registered once, at load.
+local function ask_params(req, ctx)
+  local call = {
+    toolCallId = protocol.str(req and req.tool_id),
+    title = scope_line(req),
+    name = protocol.str(req and req.tool),
+  }
+  local input = req and req.input
+  if input ~= nil and input ~= maki.NIL then
+    call.rawInput = input
+  end
+  return { sessionId = session_of(ctx), toolCall = call, options = OPTIONS }
+end
+
+--- Free text the gateway sends with a deny. ACP has no field for it, so it rides
+--- in the `_meta` of the result (WIRE 10.1), and a deny without it is a deny with
+--- no words, which is all the terminal prompt gives.
+local function guidance_of(result)
+  local meta = result._meta
+  if type(meta) ~= "table" then
+    return nil
+  end
+  local text = meta[GUIDANCE_KEY]
+  return type(text) == "string" and text or nil
+end
+
+--- The answer read as the two truths the slot can give. An option this plugin did
+--- not offer, a result it cannot parse, an error instead of a result, and a frame
+--- with neither are all a deny, which mirrors what `maki-acp` does with anything
+--- it cannot read (WIRE 10.1).
+local function verdict(answer)
+  local result = type(answer.result) == "table" and answer.result or nil
+  local outcome = result ~= nil and type(result.outcome) == "table" and result.outcome or nil
+  if answer.error ~= nil or outcome == nil or outcome.outcome ~= SELECTED then
+    return { decision = "deny" }
+  end
+  if outcome.optionId == ALLOW then
+    return { decision = "allow" }
+  end
+  if outcome.optionId == REJECT then
+    local guidance = guidance_of(result)
+    if guidance == nil or guidance == "" then
+      return { decision = "deny" }
+    end
+    return { decision = "deny", guidance = guidance }
+  end
+  return { decision = "deny" }
+end
+
+--- Withdraw one ask on every connection of it that had not answered, so their
+--- dialogs close. A gateway reads this as a withdrawn ask and not as an error
+--- (WIRE 10.2, 10.3).
+local function withdraw(record, except)
+  local frame = protocol.ok(record.id, CANCELLED)
+  for _, entry in ipairs(record.live) do
+    if entry ~= except then
+      conns.send(entry, frame)
+    end
+  end
+end
+
+--- The layer for the `permission.prompt` slot, registered once at load.
 function M.wrapper(prev, req, ctx)
-  if not bridge_on or conns.count() == 0 then
+  local record = conns.ask(METHOD, ask_params(req, ctx))
+  if record == nil then
+    -- No connection finished the handshake, so nothing would read this ask, and a
+    -- frame nobody reads only parks the tool.
     return prev(req, ctx)
   end
-  counter = counter + 1
-  local id = counter
-  local event = {
-    request_id = id,
-    session = session_id(ctx),
-    tool = protocol.str(req and req.tool),
-    input = protocol.object(req and req.input),
-  }
-  local entry = { event = event }
-  pending[id] = entry
-  protocol.emit("permission", event)
   local waited = 0
-  while waited < PERMISSION_WAIT_MS do
-    if entry.answer then
-      break
-    end
-    local called, err = pcall(maki.async.sleep, POLL_MS)
+  while record.answer == nil and waited < PERMISSION_WAIT_MS and #record.live > 0 do
+    local called, why = pcall(maki.async.sleep, POLL_MS)
     if not called then
-      maki.log.debug("gateway: permission wait stopped (" .. tostring(err) .. ")")
+      maki.log.debug("gateway: permission wait stopped (" .. tostring(why) .. ")")
       break
     end
     waited = waited + POLL_MS
   end
-  if entry.answer then
-    pending[id] = nil
-    if entry.answer.decision == "deny" then
-      return { decision = "deny", guidance = protocol.str(entry.answer.guidance) }
-    end
-    return { decision = "allow" }
+  local answer = record.answer
+  conns.settle(record)
+  if answer == nil then
+    -- Nobody answered. The ask is ended here first, so the terminal prompt is not
+    -- shadowed by a dialog that still looks answerable, and then the call goes to
+    -- that prompt (WIRE 10.2).
+    withdraw(record, nil)
+    return prev(req, ctx)
   end
-  -- Nobody answered. The terminal prompt takes the call, and the gateway gets
-  -- word that its dialog is gone so it can drop the request id.
-  entry.timed_out = true
-  if pending[id] == entry then
-    pending[id] = nil
-  end
-  protocol.emit("permission_cancel", { request_id = id })
-  return prev(req, ctx)
+  withdraw(record, answer.from)
+  return verdict(answer)
 end
 
 return M
