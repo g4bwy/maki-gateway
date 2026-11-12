@@ -1,7 +1,16 @@
 // Package attach is the "live" engine: it dials the unix sockets that the maki
-// Lua plugin serves (CONTRACTS 1) and maps plugin traffic onto model.Session
-// entries and hub events. One connection per running TUI; the gateway owns
-// nothing on that side and never writes to a socket dir.
+// Lua plugin serves (docs/WIRE.md) and maps the v2 attach protocol onto
+// model.Session entries and hub events. One connection per running TUI; the
+// gateway owns nothing on that side and never writes to a socket dir.
+//
+// The wire is a subset of ACP v1 with maki extensions, so the codec is the one
+// this repository uses for `maki acp` children too: internal/acpwire. The plugin
+// is the agent and the gateway is the client, and the only request that runs the
+// other way is a permission ask (WIRE 10).
+//
+// Two parts of the engine surface have no method behind them, and both are
+// decisions of the spec rather than gaps: no session/new opens a tab (Appendix
+// B.1), and a live tab is never cancelled from here (WIRE 7.3).
 package attach
 
 import (
@@ -15,27 +24,24 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"maki-gateway/internal/acpwire"
 	"maki-gateway/internal/model"
 )
 
-// Plugin-side limits and clocks, all from CONTRACTS 1.
+// Discovery and dialing, unchanged from v1 (WIRE 1.1).
 const (
-	maxFrame       = 8 << 20 // a bigger frame ends the connection
-	readBufferSize = 64 << 10
-	firstLineStep  = 4 << 10
-	dialTimeout    = 3 * time.Second
-	sockSuffix     = ".sock"
-
-	// pluginVersion is the value hello reports for its protocol build.
-	pluginVersion = "1"
+	sockSuffix  = ".sock"
+	dialTimeout = 3 * time.Second
 )
 
-// Event types and dirty reasons of CONTRACTS 2.
+// Event types and dirty reasons of CONTRACTS 2. The SSE surface is frozen, so
+// these names and their fields stay exactly as the bridge published them in v1.
 const (
 	evStatus   = "status"
 	evDirty    = "dirty"
@@ -55,7 +61,8 @@ const (
 	reasonTurnEnd   = "turn_end"
 	reasonToolDone  = "tool_done"
 	reasonToolStart = "tool_start"
-	// reasonStatus is what a turn_start maps to: CONTRACTS 2 lists no
+	// reasonStatus rides on the dirty that WIRE 11.2 pairs with a status change,
+	// which is where v1's turn_start nudge lives now: CONTRACTS 2 lists no
 	// turn_start reason, and "status" is the reason that also means "the tab
 	// changed, refetch it".
 	reasonStatus = "status"
@@ -63,59 +70,30 @@ const (
 	questionNotice = "question pending in terminal"
 )
 
-// Op names of CONTRACTS 1.
-const (
-	opHello     = "hello"
-	opPing      = "ping"
-	opList      = "list"
-	opMessages  = "messages"
-	opPrompt    = "prompt"
-	opNew       = "new"
-	opSetMode   = "set_mode"
-	opSetTitle  = "set_title"
-	opRespond   = "respond"
-	opPlan      = "plan"
-	opTasks     = "tasks"
-	opTaskFocus = "task_focus"
-	opPerms     = "permissions"
-	argSession  = "session"
-	argTaskID   = "task_id"
-	argText     = "text"
-	argLast     = "last"
-	argCwd      = "cwd"
-	argMode     = "mode"
-	argTitle    = "title"
-	argPrompt   = "prompt"
-	argRequest  = "request_id"
-	argDecision = "decision"
-	argGuidance = "guidance"
-	argOn       = "on"
-	argYolo     = "yolo"
-)
-
 // noUI is the plugin's fixed answer when its process has no terminal to drive
-// (lua/gateway/ops.lua NO_UI). CONTRACTS 1 keeps the words.
+// (WIRE 13.1 keeps the words). It is not a mapping of the table: a caller reads
+// it as "no screen to move", which is a 501 here.
 const noUI = "no interactive UI"
 
-// timings are the engine clocks. New uses the contract values; tests shorten
-// them so a suite does not sleep for minutes.
+// timings are the engine clocks. New uses the WIRE values; tests shorten them so
+// a suite does not sleep for minutes.
 type timings struct {
-	scanEvery time.Duration
-	pingEvery time.Duration
-	timeout   time.Duration
-	tryAll    time.Duration
-	missLimit int
-	maxLine   int
+	scanEvery  time.Duration
+	timeout    time.Duration
+	tryAll     time.Duration
+	cancelWait time.Duration
+	missLimit  int
+	maxLine    int
 }
 
 func defaultTimings() timings {
 	return timings{
-		scanEvery: 3 * time.Second,
-		pingEvery: 15 * time.Second,
-		timeout:   10 * time.Second,
-		tryAll:    3 * time.Second,
-		missLimit: 2,
-		maxLine:   maxFrame,
+		scanEvery:  3 * time.Second,
+		timeout:    10 * time.Second,
+		tryAll:     3 * time.Second,
+		cancelWait: 2 * time.Second,
+		missLimit:  2,
+		maxLine:    acpwire.MaxLine,
 	}
 }
 
@@ -125,22 +103,33 @@ type Engine struct {
 	hub     *model.Hub
 	t       timings
 
-	nextID atomic.Int64
+	// nextRequestID mints the permission request ids the hub and the HTTP route
+	// carry. WIRE 10 puts the plugin's own id on the socket and leaves this side
+	// to number its dialogs, which is what CONTRACTS 2 means by per-engine ids.
+	nextRequestID atomic.Int64
 
-	mu      sync.Mutex
-	conns   map[string]*conn // socket path -> connection
-	routes  map[string]*conn // session id -> connection that owns it
-	tickets map[int64]*conn  // plugin permission id -> connection
-	closed  bool
-	quit    chan struct{}
-	wake    chan struct{}
+	mu     sync.Mutex
+	conns  map[string]*conn // socket path -> connection
+	routes map[string]*conn // session id -> connection that owns it
+	asks   map[int64]*ask   // request id -> permission prompt held open
+	closed bool
+	quit   chan struct{}
+	wake   chan struct{}
+}
+
+// ask is one permission prompt this gateway holds open for the browser.
+type ask struct {
+	c         *conn
+	wireID    string // the id the plugin put on its own request
+	requestID int64  // the id this gateway published for it
+	req       *acpwire.Request
+	params    permissionRequest
 }
 
 // New starts watching sockDir for plugin sockets and returns immediately; the
 // engine is usable even when the directory does not exist yet.
 func New(sockDir string, hub *model.Hub) *Engine {
-	e := newEngine(sockDir, hub, defaultTimings())
-	return e
+	return newEngine(sockDir, hub, defaultTimings())
 }
 
 func newEngine(sockDir string, hub *model.Hub, t timings) *Engine {
@@ -150,7 +139,7 @@ func newEngine(sockDir string, hub *model.Hub, t timings) *Engine {
 		t:       t,
 		conns:   map[string]*conn{},
 		routes:  map[string]*conn{},
-		tickets: map[int64]*conn{},
+		asks:    map[int64]*ask{},
 		quit:    make(chan struct{}),
 		wake:    make(chan struct{}, 1),
 	}
@@ -175,13 +164,10 @@ func (e *Engine) Close() error {
 	e.mu.Unlock()
 	close(e.quit)
 	for _, c := range conns {
-		c.drop(errEngineClosed)
+		c.drop()
 	}
 	return nil
 }
-
-// errEngineClosed marks a shutdown, not a plugin fault.
-var errEngineClosed = errors.New("attach: engine closed")
 
 func (e *Engine) isClosed() bool {
 	e.mu.Lock()
@@ -209,9 +195,9 @@ func (e *Engine) watch() {
 	}
 }
 
-// scan dials every socket it does not already hold. A stale socket file (the
-// TUI died without unlinking) simply fails the dial and is tried again on the
-// next tick, which is also the retry path for a dead connection.
+// scan dials every socket it does not already hold. A stale socket file (the TUI
+// died without unlinking) simply fails the dial and is tried again on the next
+// tick, which is also the retry path for a dead connection.
 func (e *Engine) scan() {
 	entries, err := os.ReadDir(e.sockDir)
 	if err != nil {
@@ -235,8 +221,9 @@ func (e *Engine) scan() {
 	}
 }
 
-// dial opens one socket, introduces itself, and only then takes ownership of
-// the connection: an untracked failure must not raise a disconnect notice.
+// dial opens one socket, runs the handshake of WIRE 2, and only then takes
+// ownership of the connection: an untracked failure must not raise a disconnect
+// notice, and a refused plugin must never reach the list.
 func (e *Engine) dial(path string) {
 	nc, err := net.DialTimeout("unix", path, dialTimeout)
 	if err != nil {
@@ -244,18 +231,18 @@ func (e *Engine) dial(path string) {
 		return
 	}
 	c := newConn(e, path, nc)
-	go c.read()
-	go c.keepalive()
+	c.serve()
 	ctx, cancel := e.context()
-	h, err := c.hello(ctx)
+	info, err := c.initialize(ctx)
 	cancel()
 	if err != nil {
-		slog.Warn("attach: hello refused", "socket", path, "error", err)
-		c.drop(err)
+		slog.Warn("attach: initialize refused", "socket", path, "error", err)
+		c.drop()
 		return
 	}
-	if h.Plugin != "" && h.Plugin != pluginVersion {
-		slog.Warn("attach: unexpected plugin protocol build", "socket", path, "plugin", h.Plugin)
+	if !info.protoSeen || info.proto < minAttachProto {
+		e.refuse(path, c, info)
+		return
 	}
 	e.mu.Lock()
 	tracked := false
@@ -265,24 +252,32 @@ func (e *Engine) dial(path string) {
 	}
 	e.mu.Unlock()
 	if !tracked {
-		c.drop(errEngineClosed)
+		c.drop()
 		return
 	}
-	// Arm the permission bridge: the plugin only pushes permission events while
-	// it is on, so a gateway that never asks would never see a prompt. A plugin
-	// without the op answers an error, which costs the bridge and nothing else.
-	permsCtx, permsCancel := e.context()
-	err = c.call(permsCtx, opPerms, map[string]any{argOn: true}, nil)
-	permsCancel()
-	if err != nil {
-		slog.Debug("attach: permission bridge unavailable", "socket", path, "error", err)
-	}
-	slog.Debug("attach: tui connected", "socket", path, "pid", h.PID, "sessions", h.Sessions)
+	slog.Debug("attach: tui connected", "socket", path, "pid", info.pid,
+		"cwd", info.cwd, "maki", info.makiVer, "attach_proto", info.proto)
 	e.publish(model.Event{Type: evSessions})
 }
 
+// refuse ends a connection whose plugin cannot speak v2, and says so twice: in
+// one error log line, and in a notice the browser shows. A silent refusal is
+// what left a person staring at an empty list with no live rows and no reason
+// (WIRE 2.2).
+func (e *Engine) refuse(path string, c *conn, info agentInfo) {
+	seen := "none"
+	if info.protoSeen {
+		seen = strconv.FormatFloat(info.proto, 'f', -1, 64)
+	}
+	slog.Error("attach: "+tooOld, "socket", path, "pid", info.pid,
+		"attach_proto", seen, "want", minAttachProto, "maki_version", info.makiVer)
+	e.publish(model.Event{Type: evNotice, Text: fmt.Sprintf(refusalNotice, info.pid)})
+	c.drop()
+}
+
 // forgetConn drops a connection's bookkeeping and reports whether it was ever
-// tracked. Routes and tickets owned by it are void: they name a TUI that is gone.
+// tracked. Routes and parked asks owned by it are void: they name a TUI that is
+// gone, and nobody can answer them any more.
 func (e *Engine) forgetConn(dead *conn) bool {
 	e.mu.Lock()
 	tracked := false
@@ -295,9 +290,9 @@ func (e *Engine) forgetConn(dead *conn) bool {
 			delete(e.routes, id)
 		}
 	}
-	for rid, c := range e.tickets {
-		if c == dead {
-			delete(e.tickets, rid)
+	for rid, a := range e.asks {
+		if a.c == dead {
+			delete(e.asks, rid)
 		}
 	}
 	e.mu.Unlock()
@@ -316,35 +311,77 @@ func (e *Engine) routeTo(session string, c *conn) {
 	e.mu.Unlock()
 }
 
-func (e *Engine) ticketOwner(requestID int64) (*conn, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	c, ok := e.tickets[requestID]
-	return c, ok && !c.closed.Load()
-}
+// nextAskID mints one permission request id.
+func (e *Engine) nextAskID() int64 { return e.nextRequestID.Add(1) }
 
-func (e *Engine) noteTicket(requestID int64, c *conn) {
+// armAsk parks one ask and turns on the sniffer that watches for its withdrawal.
+func (e *Engine) armAsk(a *ask) {
 	e.mu.Lock()
 	if !e.closed {
-		e.tickets[requestID] = c
+		e.asks[a.requestID] = a
 	}
 	e.mu.Unlock()
+	a.c.sniff.on.Store(true)
 }
 
-func (e *Engine) dropTicket(requestID int64) {
+// takeAsk removes the ask of one request id, or returns nil when this side holds
+// no such dialog.
+func (e *Engine) takeAsk(requestID int64) *ask {
 	e.mu.Lock()
-	delete(e.tickets, requestID)
+	a := e.asks[requestID]
+	delete(e.asks, requestID)
 	e.mu.Unlock()
+	if a != nil {
+		a.c.armSniffer()
+	}
+	return a
+}
+
+// removeAskByWire takes the ask a plugin ended on its own. The scan is the whole
+// cost: a connection holds at most a few dialogs at a time.
+func (e *Engine) removeAskByWire(c *conn, wireID string) *ask {
+	e.mu.Lock()
+	var found *ask
+	for _, a := range e.asks {
+		if a.c == c && a.wireID == wireID {
+			found = a
+			delete(e.asks, a.requestID)
+			break
+		}
+	}
+	e.mu.Unlock()
+	if found != nil {
+		c.armSniffer()
+	}
+	return found
+}
+
+// armSniffer keeps the withdrawal sniffer of this connection on only while it
+// still parks an ask, so a plugin that never asks costs one atomic load per read.
+func (c *conn) armSniffer() {
+	on := c.e.asksOpenOn(c)
+	c.sniff.on.Store(on)
+}
+
+func (e *Engine) asksOpenOn(c *conn) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, a := range e.asks {
+		if a.c == c {
+			return true
+		}
+	}
+	return false
 }
 
 // owner resolves a session to its connection. The map is built from list
-// results and from every event that names a session: CONTRACTS 1 has no op
-// that finds a session across plugins.
+// results and from every event that names a session: WIRE 3 makes session/list
+// the only way to learn what a TUI holds.
 func (e *Engine) owner(session string) (*conn, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	c, ok := e.routes[session]
-	return c, ok && !c.closed.Load()
+	return c, ok && !c.wire.Closed()
 }
 
 func (e *Engine) live() []*conn {
@@ -364,48 +401,50 @@ func (e *Engine) context() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), e.t.timeout)
 }
 
-// op runs one op against the connection owning session, or against every live
-// connection when no route claims it.
-func (e *Engine) op(session, opName string, args map[string]any, out any) error {
-	raw, err := e.raw(session, opName, args)
+// op runs one request against the connection owning session, or against every
+// live connection when no route claims it, and decodes the result into out.
+func (e *Engine) op(session, method string, args any, out any) error {
+	raw, err := e.raw(session, method, args)
 	if err != nil {
 		return err
 	}
 	if out == nil {
 		return nil
 	}
-	if len(raw) == 0 {
-		return fmt.Errorf("attach: %s: %w", opName, errProtocol)
+	if len(raw) == 0 || string(raw) == "null" {
+		return fmt.Errorf("attach: %s: %w", method, errNoBody)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("attach: %s reply: %w", opName, err)
+		return fmt.Errorf("attach: %s result: %w", method, err)
 	}
 	return nil
 }
 
-func (e *Engine) raw(session, opName string, args map[string]any) (json.RawMessage, error) {
+// raw runs one request and hands back its result untouched, which is what the
+// routes that forward a plugin answer verbatim need (WIRE 6, 9.2, 9.3).
+func (e *Engine) raw(session, method string, args any) (json.RawMessage, error) {
 	if c, ok := e.owner(session); ok {
 		ctx, cancel := e.context()
-		raw, err := c.request(ctx, opName, args)
+		raw, err := c.request(ctx, method, args)
 		cancel()
 		if !stale(err) {
-			return raw, MapError(err)
+			return raw, nameMethod(method, MapError(err))
 		}
-		// The route claimed a session the plugin no longer has: the TUI
-		// closed the tab. Re-resolve through every connection.
+		// The route claimed a tab the plugin no longer has: the TUI closed it.
+		// Re-resolve through every connection.
 		e.mu.Lock()
 		if e.routes[session] == c {
 			delete(e.routes, session)
 		}
 		e.mu.Unlock()
 	}
-	raw, err := e.fanOut(opName, args)
-	return raw, MapError(err)
+	raw, err := e.fanOut(method, args)
+	return raw, nameMethod(method, MapError(err))
 }
 
 // fanOut asks every live connection and keeps the first answer. The budget is
 // shorter than a normal request: nobody should wait for the slowest TUI.
-func (e *Engine) fanOut(opName string, args map[string]any) (json.RawMessage, error) {
+func (e *Engine) fanOut(method string, args any) (json.RawMessage, error) {
 	conns := e.live()
 	if len(conns) == 0 {
 		return nil, fmt.Errorf("%w: no live tui", model.ErrNotFound)
@@ -422,7 +461,7 @@ func (e *Engine) fanOut(opName string, args map[string]any) (json.RawMessage, er
 		wg.Add(1)
 		go func(c *conn) {
 			defer wg.Done()
-			raw, err := c.request(ctx, opName, args)
+			raw, err := c.request(ctx, method, args)
 			if err != nil {
 				fails <- err
 				return
@@ -453,18 +492,19 @@ func (e *Engine) fanOut(opName string, args map[string]any) (json.RawMessage, er
 	return nil, firstErr
 }
 
-// stale reports a plugin error that means "not my session", so an outdated
-// route can be re-resolved instead of failing the call.
+// stale reports a plugin answer that means "not my tab", so an outdated route can
+// be re-resolved instead of failing the call. WIRE 13 gives that fact a code of
+// its own (-32002) and the words of WIRE 13.1 to carry it.
 func stale(err error) bool {
-	var pe pluginError
-	if !errors.As(err, &pe) {
+	var we *acpwire.Error
+	if !errors.As(err, &we) {
 		return false
 	}
-	return matchAny(string(pe), notLive, unknownID)
+	return we.Code == codeNotLive || matchAny(we.Message, notLive, unknownID)
 }
 
-// Error fragments the plugin writes (CONTRACTS 1). They are matched, not
-// compared, because the text carries the session id.
+// Error fragments the plugin writes (WIRE 13.1). They are matched, not compared,
+// because the text carries the session id.
 const (
 	notLive       = "session not live"
 	openElsewhere = "another"
@@ -484,14 +524,15 @@ func matchAny(msg string, frags ...string) bool {
 	return false
 }
 
-// MapError turns a plugin error string into the sentinel errors the HTTP layer
-// already speaks. Transport faults are passed through untouched.
+// MapError turns a plugin error into the sentinel errors the HTTP layer already
+// speaks, by the substring table of WIRE 13.1. A transport fault is not a plugin
+// answer, so it passes through untouched.
 func MapError(err error) error {
-	var pe pluginError
-	if !errors.As(err, &pe) {
+	var we *acpwire.Error
+	if !errors.As(err, &we) {
 		return err
 	}
-	msg := string(pe)
+	msg := we.Message
 	switch {
 	case matchAny(msg, notLive, expired, unknownID, noSuch):
 		return fmt.Errorf("%w: %s", model.ErrNotFound, msg)
@@ -499,6 +540,16 @@ func MapError(err error) error {
 		return fmt.Errorf("%w: %s", model.ErrOpenElsewhere, msg)
 	case matchAny(msg, busyText):
 		return fmt.Errorf("%w: %s", model.ErrBusy, msg)
+	}
+	return err
+}
+
+// nameMethod keeps the promise of WIRE 12.2: a -32601 for any method but
+// session/cancel reaches a caller as an error that names the method.
+func nameMethod(method string, err error) error {
+	var we *acpwire.Error
+	if errors.As(err, &we) && we.Code == acpwire.CodeMethodNotFound {
+		return fmt.Errorf("attach: %s: %w", method, err)
 	}
 	return err
 }
@@ -515,32 +566,42 @@ func (e *Engine) disconnected(pid int) {
 	e.publish(model.Event{Type: evSessions})
 }
 
-// List asks every live TUI for its tabs. A connection that fails is left out:
-// its sessions disappear from the merged list, which is the truth, and its
-// reader drops it a moment later.
+// List asks every live TUI for its tabs, which is also the liveness clock of
+// WIRE 1.5: two polls in a row that fail or time out end that connection, and
+// its tabs leave the list. There is no ping on this wire.
 func (e *Engine) List() ([]model.Session, error) {
 	conns := e.live()
 	out := make([]model.Session, 0, len(conns))
 	for _, c := range conns {
 		ctx, cancel := e.context()
-		var items []liveSession
-		err := c.call(ctx, opList, nil, &items)
+		var res listResult
+		err := c.call(ctx, mSessionList, noArgs, &res)
 		cancel()
 		if err != nil {
 			slog.Debug("attach: list failed", "socket", c.path, "error", err)
+			if misses := c.countMiss(); misses >= e.t.missLimit {
+				slog.Warn("attach: plugin stopped answering the list poll, dropping it",
+					"socket", c.path, "pid", c.pluginPID(), "misses", misses)
+				c.drop()
+			}
 			continue
 		}
+		c.resetMisses()
 		pid := c.pluginPID()
-		for _, s := range items {
-			e.routeTo(s.ID, c)
+		for _, row := range res.Sessions {
+			e.routeTo(row.SessionID, c)
+			cwd := row.Meta.str(metaCwd)
+			if cwd == "" {
+				cwd = row.Cwd
+			}
 			out = append(out, model.Session{
-				ID:        s.ID,
+				ID:        row.SessionID,
 				Kind:      model.KindLive,
-				Title:     s.Title,
-				Status:    s.Status,
-				Cwd:       s.Cwd,
-				Model:     s.Model,
-				UpdatedAt: s.UpdatedAt,
+				Title:     row.Title,
+				Status:    row.Meta.str(metaStatus),
+				Cwd:       cwd,
+				Model:     row.Meta.str(metaModel),
+				UpdatedAt: epochSeconds(row.UpdatedAt),
 				PluginPID: pid,
 			})
 		}
@@ -548,103 +609,154 @@ func (e *Engine) List() ([]model.Session, error) {
 	return out, nil
 }
 
-// Messages reads a tab's transcript. CONTRACTS 1 always wants session and last.
+// Messages reads a tab's transcript through _sh.maki/messages, the one method
+// WIRE 6 keeps bespoke because an ACP update stream cannot rebuild a native
+// record. The records pass through verbatim.
 func (e *Engine) Messages(id string, last int) ([]model.Message, error) {
-	var body messagesBody
-	args := map[string]any{argSession: id, argLast: last}
-	if err := e.op(id, opMessages, args, &body); err != nil {
+	var res messagesResult
+	args := map[string]any{argSessionID: id, argLast: last}
+	if err := e.op(id, mMessages, args, &res); err != nil {
 		return nil, err
 	}
-	return body.Messages, nil
+	return res.Messages, nil
 }
 
-// Prompt injects a line and reports "started" or "queued".
+// Prompt puts text in front of a live tab and reports "started" or "queued" at
+// once. session/prompt cannot answer before the turn ends (WIRE 7.1), and the
+// HTTP contract answers with the queue state immediately, so the route calls
+// _sh.maki/queue (WIRE 7.2).
 func (e *Engine) Prompt(id, text string) (string, error) {
-	var state string
-	if err := e.op(id, opPrompt, map[string]any{argSession: id, argText: text}, &state); err != nil {
+	var res queueResult
+	args := map[string]any{argSessionID: id, argText: text}
+	if err := e.op(id, mQueue, args, &res); err != nil {
 		return "", err
 	}
-	return state, nil
+	return res.State, nil
 }
 
-// Cancel has no plugin op: the contract stops at prompt, and CONTRACTS 2 answers
-// 501 for a live session. Stop the turn in the terminal instead.
-func (e *Engine) Cancel(string) error { return model.ErrUnsupported }
-
-// Kill has no plugin op either: the TUI outlives the gateway by design, so the
-// HTTP layer refuses DELETE for a live session.
-func (e *Engine) Kill(string) error { return model.ErrUnsupported }
-
-// SetMode switches a tab between build and plan.
-func (e *Engine) SetMode(id, mode string) error {
-	return e.op(id, opSetMode, map[string]any{argSession: id, argMode: mode}, nil)
-}
-
-// SetTitle renames a tab. An empty title clears it, which the plugin spells
-// null (CONTRACTS 1).
-func (e *Engine) SetTitle(id, title string) error {
-	var value any
-	if title != "" {
-		value = title
+// Cancel asks a live tab to stop, and WIRE 7.3 says it cannot. The request goes
+// out so a plugin can answer: a -32601 or no answer at all both mean the same
+// thing here, and a person stops a turn at the terminal.
+func (e *Engine) Cancel(id string) error {
+	c, ok := e.owner(id)
+	if !ok {
+		return model.ErrUnsupported
 	}
-	return e.op(id, opSetTitle, map[string]any{argSession: id, argTitle: value}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), e.t.cancelWait)
+	defer cancel()
+	_, err := c.request(ctx, mSessionCancel, map[string]any{argSessionID: id})
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) || isMethodNotFound(err) {
+		return model.ErrUnsupported
+	}
+	return MapError(err)
 }
 
-// Create opens a background tab in the first live TUI, lowest socket path
-// winning so repeated calls land on one process. m is dropped: the new op takes
-// no model, so the tab keeps that TUI's current model. Yolo travels to the op as
-// `yolo:true`, and the plugin ignores it: a tab of a running TUI cannot skip the
-// permission prompts of a process that was started without it.
+func isMethodNotFound(err error) bool {
+	var we *acpwire.Error
+	return errors.As(err, &we) && we.Code == acpwire.CodeMethodNotFound
+}
+
+// Kill has no method on this socket: the TUI owns its process and outlives the
+// gateway by design, so DELETE answers 400 for a live row. What this side can do
+// is hang up, which drops that TUI's tabs from the list until the next scan dials
+// it again.
+func (e *Engine) Kill(id string) error {
+	c, ok := e.owner(id)
+	if !ok {
+		return model.ErrUnsupported
+	}
+	c.drop()
+	return nil
+}
+
+// SetMode switches a tab between build and plan (WIRE 8.1).
+func (e *Engine) SetMode(id, mode string) error {
+	args := map[string]any{argSessionID: id, argModeID: mode}
+	return e.op(id, mSessionSetMode, args, nil)
+}
+
+// SetTitle renames a tab. An empty title clears it, which is the one spelling
+// WIRE 8.2 keeps: v1's null has no empty value to echo in JSON.
+func (e *Engine) SetTitle(id, title string) error {
+	args := map[string]any{argSessionID: id, argTitle: title}
+	return e.op(id, mSessionSetTitle, args, nil)
+}
+
+// Create cannot open a tab. WIRE Appendix B.1 fixes that no session/new exists on
+// this socket: a live tab is opened by a person at the terminal, and a plugin
+// answers session/new with -32601. The request still goes out to the lowest
+// socket, so a build that does answer one is read, and a refusal is reported as
+// what it is. A caller that must create a session spawns maki acp, which is what
+// the HTTP route does.
 func (e *Engine) Create(req model.CreateRequest) (string, error) {
 	conns := e.live()
 	if len(conns) == 0 {
 		return "", fmt.Errorf("%w: no live tui", model.ErrNotFound)
 	}
-	args := map[string]any{}
+	args := map[string]any{argMCPServers: []any{}}
 	if req.Cwd != "" {
 		args[argCwd] = req.Cwd
 	}
-	if req.Prompt != "" {
-		args[argPrompt] = req.Prompt
-	}
-	if req.Yolo {
-		args[argYolo] = true
-	}
 	ctx, cancel := e.context()
-	raw, err := conns[0].request(ctx, opNew, args)
+	raw, err := conns[0].request(ctx, mSessionNew, args)
 	cancel()
 	if err != nil {
+		if isMethodNotFound(err) {
+			return "", model.ErrUnsupported
+		}
 		return "", MapError(err)
 	}
-	var body newBody
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return "", fmt.Errorf("attach: %s reply: %w", opNew, err)
+	var body struct {
+		SessionID string `json:"sessionId"`
 	}
-	e.routeTo(body.Session, conns[0])
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return "", fmt.Errorf("attach: %s result: %w", mSessionNew, err)
+	}
+	e.routeTo(body.SessionID, conns[0])
 	e.publish(model.Event{Type: evSessions})
-	return body.Session, nil
+	return body.SessionID, nil
 }
 
-// Plan returns the socket plan op answer for a live tab: {"mode","path","ready",
+// Notify writes one line into a live tab (WIRE 9.1). Without a session it goes to
+// the focused tab, so the call is fanned out and the first TUI that has one
+// answers.
+func (e *Engine) Notify(session, text string) error {
+	args := map[string]any{argText: text}
+	if session == "" {
+		_, err := e.fanOut(mNotify, args)
+		return nameMethod(mNotify, MapError(err))
+	}
+	args[argSessionID] = session
+	return e.op(session, mNotify, args, nil)
+}
+
+// Plan returns the socket plan answer for a live tab: {"mode","path","ready",
 // "content"}, forwarded as raw JSON because the browser renders it verbatim
-// (CONTRACTS 1, GET /api/plan/{id}).
+// (WIRE 9.2, GET /api/plan/{id}).
 func (e *Engine) Plan(id string) (json.RawMessage, error) {
-	return e.raw(id, opPlan, map[string]any{argSession: id})
+	return e.raw(id, mPlan, map[string]any{argSessionID: id})
 }
 
-// Tasks returns the socket tasks op answer for a live tab, raw JSON of the
-// maki.task.list() rows ({"id","session","name","status","focused",...}). The op
-// takes no session argument, because maki only lists the focused tab's chats, so
-// the id says which TUI to ask and the rows are that TUI's focused tab.
+// Tasks returns the socket tasks answer for a live tab, raw JSON of the
+// maki.task.list() rows ({"id","session","name","status","focused",...}). The
+// method names no session, because maki only lists the focused tab's chats, so
+// the id here says which TUI to ask and the rows are that TUI's focused tab
+// (WIRE 9.3). The result is a bare array: the {"tasks":...} wrapper the HTTP
+// route answers is the gateway's own, and stays in httpapi.
 func (e *Engine) Tasks(id string) (json.RawMessage, error) {
-	return e.raw(id, opTasks, nil)
+	return e.raw(id, mTasks, noArgs)
 }
 
 // FocusTask moves the followed chat of a live tab, which is the terminal side of
-// GET /api/sessions/{id}/tasks/{tid}/focus (CONTRACTS 2). The op names no
+// POST /api/sessions/{id}/tasks/{tid}/focus (WIRE 9.4). The method names no
 // session, because the host moves a chat of the tab the terminal already has
 // focused, so the id here only says which TUI to ask. The task it moves goes in
-// `task_id`, which leaves the frame's own `id` free for its request number.
+// `taskId`, which is the whole argument: v1's habit of taking the same name in
+// the frame's own request number is gone with the collision that made it
+// necessary.
 //
 // It asks that TUI alone rather than every live one: following is a change to a
 // screen, and a browser that follows one terminal must not move another's.
@@ -660,22 +772,25 @@ func (e *Engine) FocusTask(session, taskID string) error {
 	}
 	ctx, cancel := e.context()
 	defer cancel()
-	var pe pluginError
-	if err := c.call(ctx, opTaskFocus, map[string]any{argTaskID: taskID}, nil); err != nil {
-		if !errors.As(err, &pe) {
-			return MapError(err)
-		}
-		words := string(pe)
-		if matchAny(words, noUI) {
-			return Refusal{Err: model.ErrUnsupported, Words: words}
-		}
-		return Refusal{Err: model.ErrNotFound, Words: words}
+	// Only an answer from the plugin earns the treatment of its own words. The
+	// death of the socket is a transport fault, and its text says nothing about
+	// this click.
+	err := c.call(ctx, mTaskFocus, map[string]any{argTaskID: taskID}, nil)
+	if err == nil {
+		return nil
 	}
-	return nil
+	var we *acpwire.Error
+	if errors.Is(err, errGone) || !errors.As(err, &we) {
+		return MapError(err)
+	}
+	if matchAny(we.Message, noUI) {
+		return Refusal{Err: model.ErrUnsupported, Words: we.Message}
+	}
+	return Refusal{Err: model.ErrNotFound, Words: we.Message}
 }
 
 // Refusal is one plugin answer the browser reads as written. Words are the
-// plugin's own, which CONTRACTS 1 fixes, and Err is the sentinel that picks the
+// plugin's own, which WIRE 13.1 fixes, and Err is the sentinel that picks the
 // HTTP status. Wrapping with %w would put that sentinel's text in front of words
 // that are already a complete sentence about the user's own click.
 type Refusal struct {
@@ -687,32 +802,31 @@ func (r Refusal) Error() string { return r.Words }
 
 func (r Refusal) Unwrap() error { return r.Err }
 
-// RespondPermission answers a parked permission prompt. The plugin request id
-// arrives with the permission event, so the ticket map knows who parked it; a
-// gateway that never saw the event asks everyone.
+// RespondPermission answers a parked permission ask. The id is the one this
+// gateway published on the permission event, so the ask map names the connection
+// and the request it still owes.
 //
 // allow_always degrades here rather than in the plugin: the permission.prompt
-// slot a live tab wraps answers allow or deny and nothing else, so the Lua side
-// keeps its binary verdict (lua/gateway/permission.lua) and "always" is dropped.
-// A live tab therefore asks again on the next call, which is the same answer an
-// allow already gives today.
+// slot a live tab wraps answers allow or deny and nothing else, so the wire
+// offers two options and "always" is dropped (WIRE 10.1). A live tab therefore
+// asks again on the next call, which is the same answer an allow already gives.
+// Guidance has no ACP field, so it travels in the _meta of the result.
 func (e *Engine) RespondPermission(requestID int64, decision, guidance string) error {
 	if decision == model.DecisionAllowAlways {
 		decision = model.DecisionAllow
 	}
-	args := map[string]any{argRequest: requestID, argDecision: decision}
-	if guidance != "" {
-		args[argGuidance] = guidance
+	want := optionReject
+	if decision == model.DecisionAllow {
+		want = optionAllowOnce
 	}
-	var err error
-	if c, ok := e.ticketOwner(requestID); ok {
-		ctx, cancel := e.context()
-		_, err = c.request(ctx, opRespond, args)
-		cancel()
-		e.dropTicket(requestID)
-	} else {
-		_, err = e.fanOut(opRespond, args)
-		err = MapError(err)
+	a := e.takeAsk(requestID)
+	if a == nil {
+		// WIRE 13.1: this side writes the word itself, and the mapping reads it
+		// back as the 404 for a dialog that is no longer held.
+		return fmt.Errorf("%w: permission %d expired", model.ErrNotFound, requestID)
 	}
-	return MapError(err)
+	if err := a.req.Answer(newPermissionResult(a.params.optionID(want), guidance)); err != nil {
+		return fmt.Errorf("attach: answer permission: %w", err)
+	}
+	return nil
 }

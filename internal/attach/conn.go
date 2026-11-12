@@ -1,283 +1,166 @@
 package attach
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
+
+	"maki-gateway/internal/acpwire"
 )
 
-// errGone reports a connection that died while a request was in flight.
-var errGone = errors.New("attach: plugin connection closed")
+// errGone answers every request still open when a plugin connection ends, and is
+// the cause of a local hang-up. WIRE 13.2 makes the end of a connection a fault
+// of the conversation rather than of one request, so one value covers every
+// death. No substring of it is a word of the WIRE 13.1 table, so MapError leaves
+// it alone and the caller reads a transport fault.
+var errGone = &acpwire.Error{Code: acpwire.CodeInternal, Message: "attach: plugin connection closed"}
 
-// errOversizeLine reports a frame past 8 MiB, which ends the connection
-// (CONTRACTS 1).
-var errOversizeLine = errors.New("attach: oversized frame")
+// errNoBody is a result that is absent or JSON null where the method promises an
+// object, so a caller never reads an empty success it has nothing to decode. A
+// frame with neither reply field at all is the codec's ErrProtocol, and it ends
+// the connection (WIRE 1.3).
+var errNoBody = errors.New("attach: protocol violation: reply carries no result body")
 
-// errProtocol reports a response frame that carries neither "ok" nor "error".
-// CONTRACTS 1 makes exactly one of them mandatory, so such a frame is a plugin
-// bug and must never look like a success whose payload happens to be empty.
-var errProtocol = errors.New("attach: protocol violation: reply has neither ok nor error")
+// tooOld is the one fix for a refused plugin. It is the words in the error log
+// line and in the notice the browser shows (WIRE 2.2), because a silent refusal
+// is what made v1 confusing when an old plugin met a new gateway.
+const tooOld = "plugin too old, run /packupdate maki-gateway"
 
-// reply is one answer, matched to its request by id.
-type reply struct {
-	result json.RawMessage
-	err    error
-}
+// refusalNotice is the SSE notice of a refused plugin. It names the pid, as
+// WIRE 2.2 asks, so a reader of the browser can tie it to the log line.
+const refusalNotice = "attach refused (pid %d): plugin too old for this gateway, run /packupdate maki-gateway"
 
-// pluginError carries the error string the plugin replied with, so the op
-// mappers can recognise it.
-type pluginError string
+// noArgs is the params of a request that takes none. WIRE 1.3 fixes the
+// spelling: an empty object, not an absent field.
+var noArgs = map[string]any{}
 
-func (p pluginError) Error() string { return string(p) }
+// snifferMax bounds one line the withdrawal sniffer parses. The frame it looks
+// for is one small answer, so a longer line is none of its business.
+const snifferMax = 64 << 10
 
-// conn is one plugin socket: a reader goroutine, a serialised writer, and the
-// requests waiting for their answer.
+// conn is one plugin socket: the acpwire connection, what the handshake
+// reported, the liveness clock, and the tool cards this connection has seen open.
 type conn struct {
-	e    *Engine
-	path string
-	nc   net.Conn
+	e     *Engine
+	path  string
+	wire  *acpwire.Conn
+	sniff *sniffer
 
-	writeMu sync.Mutex
-	enc     *json.Encoder
-
-	mu      sync.Mutex
-	pending map[int64]chan reply
-	misses  int
-	pid     int
-
-	done      chan struct{}
-	closed    atomic.Bool
-	closeOnce sync.Once
+	mu     sync.Mutex
+	misses int
+	info   agentInfo
+	tools  map[string]bool
 }
+
+// socket is the plugin connection as the codec sees it. Reads pass through the
+// sniffer, which is the only way to see the one frame the codec drops by rule
+// (see sniffer).
+type socket struct {
+	nc    net.Conn
+	sniff *sniffer
+}
+
+func (s socket) Read(p []byte) (int, error) {
+	n, err := s.nc.Read(p)
+	if n > 0 {
+		s.sniff.feed(p[:n])
+	}
+	return n, err
+}
+
+func (s socket) Write(p []byte) (int, error) { return s.nc.Write(p) }
+func (s socket) Close() error                { return s.nc.Close() }
 
 func newConn(e *Engine, path string, nc net.Conn) *conn {
-	c := &conn{
-		e:       e,
-		path:    path,
-		nc:      nc,
-		pending: map[int64]chan reply{},
-		done:    make(chan struct{}),
-	}
-	c.enc = json.NewEncoder(nc)
+	c := &conn{e: e, path: path, tools: map[string]bool{}}
+	c.sniff = &sniffer{c: c}
+	c.wire = acpwire.New(socket{nc: nc, sniff: c.sniff}, acpwire.Options{
+		MaxLine:        e.t.maxLine,
+		Death:          errGone,
+		OnRequest:      c.onAsk,
+		OnNotification: c.onNote,
+		OnClose:        c.died,
+	})
 	return c
 }
 
-// hello asks the plugin who it is and remembers the pid the notice text and
-// model.Session.PluginPID report.
-func (c *conn) hello(ctx context.Context) (helloBody, error) {
-	var h helloBody
-	if err := c.call(ctx, opHello, nil, &h); err != nil {
-		return h, err
+// serve starts the read pump. Nothing is routed before initialize is answered
+// (WIRE 2.1), so the handshake of dial runs after this and blocks on its own call.
+func (c *conn) serve() { c.wire.Start() }
+
+// initialize registers this connection (WIRE 2.1) and caches what its _meta
+// reports: the pid the list rows and the notices name, the cwd, the attach build,
+// and the maki version. The gate of WIRE 2.2 belongs to the caller, because it
+// owes a log line and a notice rather than an error.
+func (c *conn) initialize(ctx context.Context) (agentInfo, error) {
+	raw, err := c.wire.Call(ctx, mInitialize, map[string]any{
+		argProtocolVersion:    acpProtocol,
+		argClientCapabilities: map[string]any{},
+	})
+	if err != nil {
+		return c.agent(), err
 	}
+	var res initResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return c.agent(), fmt.Errorf("attach: %s result: %w", mInitialize, err)
+	}
+	info := agentInfo{cwd: res.Meta.str(metaCwd), makiVer: res.Meta.str(metaMakiVersion)}
+	if pid, ok := res.Meta.num(metaPID); ok {
+		info.pid = int(pid)
+	}
+	info.proto, info.protoSeen = res.Meta.num(metaAttachProto)
 	c.mu.Lock()
-	c.pid = h.PID
+	c.info = info
 	c.mu.Unlock()
-	return h, nil
+	return info, nil
 }
 
-func (c *conn) pluginPID() int {
+func (c *conn) agent() agentInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.pid
+	return c.info
 }
 
-// request is one op on the wire. args are merged into the frame next to id and
-// op, so a nil map means an argument-less op. The id is registered before the
-// check of closed: that way a drop racing this call either finds the id in the
-// map and answers it, or the caller sees errGone. Never a hung request.
-func (c *conn) request(ctx context.Context, op string, args map[string]any) (json.RawMessage, error) {
-	id := c.e.nextID.Add(1)
-	frame := make(map[string]any, len(args)+2)
-	frame["id"] = id
-	frame["op"] = op
-	for k, v := range args {
-		frame[k] = v
-	}
-	ch := make(chan reply, 1)
-	c.mu.Lock()
-	c.pending[id] = ch
-	dead := c.closed.Load()
-	c.mu.Unlock()
-	defer c.forget(id)
-	if dead {
+func (c *conn) pluginPID() int { return c.agent().pid }
+
+// request is one call on the wire. A connection that has ended answers at once,
+// so a caller never waits on a socket that cannot answer.
+func (c *conn) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	if c.wire.Closed() {
 		return nil, errGone
 	}
-	if err := c.write(frame); err != nil {
-		return nil, err
-	}
-	select {
-	case r := <-ch:
-		return r.result, r.err
-	case <-ctx.Done():
-		return nil, fmt.Errorf("attach: %s: %w", op, ctx.Err())
-	case <-c.done:
-		return nil, errGone
-	}
+	return c.wire.Call(ctx, method, params)
 }
 
-// call sends one op and decodes the ok value into out (skip with nil).
-func (c *conn) call(ctx context.Context, op string, args map[string]any, out any) error {
-	raw, err := c.request(ctx, op, args)
+// call sends one request and decodes the result into out (skip with nil).
+func (c *conn) call(ctx context.Context, method string, params any, out any) error {
+	raw, err := c.request(ctx, method, params)
 	if err != nil {
 		return err
 	}
 	if out == nil {
 		return nil
 	}
-	if len(raw) == 0 {
-		return fmt.Errorf("attach: %s: %w", op, errProtocol)
+	if len(raw) == 0 || string(raw) == "null" {
+		return fmt.Errorf("attach: %s: %w", method, errNoBody)
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("attach: %s reply: %w", op, err)
+		return fmt.Errorf("attach: %s result: %w", method, err)
 	}
 	return nil
 }
 
-func (c *conn) forget(id int64) {
-	c.mu.Lock()
-	delete(c.pending, id)
-	c.mu.Unlock()
-}
-
-// write serialises one frame. json.Encoder appends the newline for us.
-func (c *conn) write(frame any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.closed.Load() {
-		return errGone
-	}
-	if err := c.enc.Encode(frame); err != nil {
-		return fmt.Errorf("attach: write %s: %w", c.path, err)
-	}
-	return nil
-}
-
-// read splits the stream into frames and routes them: an id goes to the waiting
-// request, an event name goes to the hub. Frames are cut on the newline by hand
-// rather than with a json.Decoder, because CONTRACTS 1 makes an 8 MiB frame
-// fatal: the cap has to be enforced on the bytes, before anything is parsed.
-// It owns the connection's death: whatever the exit, everything pending is
-// failed and the socket closed.
-func (c *conn) read() {
-	br := bufio.NewReaderSize(c.nc, readBufferSize)
-	buf := make([]byte, 0, firstLineStep)
-	var reason error
-	for {
-		line, err := readLine(br, buf, c.e.t.maxLine)
-		switch {
-		case errors.Is(err, errOversizeLine):
-			slog.Warn("attach: oversized frame, dropping plugin", "socket", c.path, "limit", c.e.t.maxLine)
-			reason = errOversizeLine
-		case errors.Is(err, io.EOF):
-			reason = io.EOF
-		case err != nil:
-			reason = err
-		}
-		if reason != nil {
-			break
-		}
-		var m message
-		if err := json.Unmarshal(line, &m); err != nil {
-			slog.Debug("attach: unparseable frame", "socket", c.path, "error", err)
-			continue
-		}
-		if m.Event != "" {
-			c.handleEvent(&m)
-			continue
-		}
-		if id, ok := m.requestID(); ok {
-			if !answered(line) {
-				slog.Warn("attach: plugin reply without ok or error, dropping plugin",
-					"socket", c.path, "id", id)
-				c.reject(id, errProtocol)
-				reason = errProtocol
-				break
-			}
-			c.deliver(id, &m)
-		}
-	}
-	c.drop(reason)
-}
-
-// deliver hands an answer to its waiter, if anyone still waits.
-func (c *conn) deliver(id int64, m *message) {
-	if ch := c.pop(id); ch != nil {
-		r := reply{result: m.OK}
-		if m.Error != nil {
-			r.err = pluginError(*m.Error)
-		}
-		ch <- r
-	}
-}
-
-// reject fails one waiting request with a fault of the plugin's framing rather
-// than an answer, so the caller learns what broke before the connection dies.
-func (c *conn) reject(id int64, err error) {
-	if ch := c.pop(id); ch != nil {
-		ch <- reply{err: err}
-	}
-}
-
-// pop takes the waiter of one id out of the map, or nil when nobody waits.
-func (c *conn) pop(id int64) chan reply {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ch := c.pending[id]
-	delete(c.pending, id)
-	return ch
-}
-
-// answered reports whether a response frame carries one of the two reply
-// fields. The keys, not their values, decide: "ok":null answers, a bare id
-// answers nothing.
-func answered(line []byte) bool {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(line, &fields); err != nil {
-		return false
-	}
-	_, ok := fields[fieldOK]
-	if !ok {
-		_, ok = fields[fieldErr]
-	}
-	return ok
-}
-
-// keepalive pings on its own clock: two misses in a row mean the TUI is gone or
-// stuck, and a stuck plugin would otherwise hold its sessions open forever.
-func (c *conn) keepalive() {
-	t := time.NewTicker(c.e.t.pingEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-c.done:
-			return
-		case <-t.C:
-			var pong string
-			ctx, cancel := context.WithTimeout(context.Background(), c.e.t.timeout)
-			err := c.call(ctx, opPing, nil, &pong)
-			cancel()
-			if err == nil {
-				c.resetMisses()
-				continue
-			}
-			if c.countMiss() < c.e.t.missLimit {
-				slog.Debug("attach: ping missed", "socket", c.path, "error", err)
-				continue
-			}
-			c.drop(fmt.Errorf("ping: %w", err))
-			return
-		}
-	}
-}
-
+// countMiss records one failed list poll and reports whether the plugin has now
+// missed the limit. The list poll is the liveness clock of WIRE 1.5: there is no
+// ping, and a plugin that stops answering it is gone or stuck.
 func (c *conn) countMiss() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -291,52 +174,126 @@ func (c *conn) resetMisses() {
 	c.mu.Unlock()
 }
 
-// drop ends the connection once, whatever the reason.
-func (c *conn) drop(reason error) {
-	c.closeOnce.Do(func() {
-		c.closed.Store(true)
-		close(c.done)
-		if err := c.nc.Close(); err != nil {
-			slog.Debug("attach: close socket", "error", err)
-		}
-		c.mu.Lock()
-		for _, ch := range c.pending {
-			ch <- reply{err: errGone}
-		}
-		c.pending = map[int64]chan reply{}
-		c.mu.Unlock()
-		slog.Debug("attach: plugin connection closed", "socket", c.path, "reason", reason)
-		if tracked := c.e.forgetConn(c); tracked && !c.e.isClosed() {
-			c.e.disconnected(c.pluginPID())
-		}
-	})
+// openTool marks one tool card open and reports whether it was open already.
+func (c *conn) openTool(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.tools) >= maxToolCards {
+		c.tools = map[string]bool{}
+	}
+	was := c.tools[id]
+	c.tools[id] = true
+	return was
 }
 
-// readLine returns the next '\n'-terminated frame without its newline. The
-// result aliases buf and is only valid until the next call. A frame longer than
-// max is drained and reported as errOversizeLine, so the caller can close the
-// connection instead of growing without bound.
-func readLine(br *bufio.Reader, buf []byte, max int) ([]byte, error) {
-	line := buf[:0]
-	oversize := false
-	for {
-		chunk, err := br.ReadSlice('\n')
-		if !oversize {
-			if len(line)+len(chunk) > max {
-				oversize, line = true, line[:0]
-			} else {
-				line = append(line, chunk...)
+// closeTool forgets one card and reports whether it was open.
+func (c *conn) closeTool(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	was := c.tools[id]
+	delete(c.tools, id)
+	return was
+}
+
+// drop ends the connection. Every open call fails with errGone, and died reports
+// the fact once.
+func (c *conn) drop() {
+	if err := c.wire.Close(); err != nil {
+		slog.Debug("attach: close socket", "socket", c.path, "error", err)
+	}
+}
+
+// died runs once per connection, after the codec ended it and failed every open
+// call. It owns the disconnect report, because the cause is only known here.
+func (c *conn) died(cause error) {
+	switch {
+	case errors.Is(cause, acpwire.ErrFrameTooLarge):
+		slog.Warn("attach: oversized frame, dropping plugin", "socket", c.path, "limit", c.e.t.maxLine)
+	case errors.Is(cause, acpwire.ErrProtocol):
+		slog.Warn("attach: plugin reply with neither result nor error, dropping plugin", "socket", c.path)
+	case errors.Is(cause, acpwire.ErrParse):
+		slog.Warn("attach: unparseable frame, dropping plugin", "socket", c.path, "error", cause)
+	default: // a clean end of stream, or a hang-up this side asked for
+		slog.Debug("attach: plugin connection closed", "socket", c.path, "reason", cause)
+	}
+	if tracked := c.e.forgetConn(c); tracked && !c.e.isClosed() {
+		c.e.disconnected(c.pluginPID())
+	}
+}
+
+// sniffer watches the bytes a plugin writes for the one frame the codec cannot
+// hand to anyone: the plugin's own answer to a request it sent (WIRE 10.2, 10.3).
+// Such a frame is a response whose id matches no open request on this side, and
+// WIRE 1.4 makes the codec drop it, so the withdrawal of a dialog would be
+// invisible and the browser's prompt would sit there forever. The sniffer is
+// armed only while this connection parks an ask, parses nothing above
+// snifferMax bytes, and runs on the codec's own read goroutine.
+type sniffer struct {
+	c     *conn
+	on    atomic.Bool
+	armed bool
+	line  []byte
+	skip  bool
+}
+
+// feed runs on the codec's read goroutine and owns every field but the flag the
+// engine sets, so the edge between off and on is read here rather than written
+// there: a cycle starts on a line boundary and cannot splice two unrelated reads.
+func (s *sniffer) feed(p []byte) {
+	on := s.on.Load()
+	if on != s.armed {
+		s.armed, s.line, s.skip = on, s.line[:0], false
+	}
+	if !on {
+		return
+	}
+	for _, b := range p {
+		if b != '\n' {
+			if s.skip {
+				continue
 			}
-		}
-		if errors.Is(err, bufio.ErrBufferFull) {
+			if len(s.line) >= snifferMax {
+				s.line, s.skip = s.line[:0], true
+				continue
+			}
+			s.line = append(s.line, b)
 			continue
 		}
-		if err != nil {
-			return nil, err
+		line := s.line
+		s.line, s.skip = s.line[:0], false
+		if len(line) > 0 {
+			s.check(line)
 		}
-		if oversize {
-			return nil, errOversizeLine
-		}
-		return line, nil
 	}
+}
+
+var sniffMark = []byte(`"result"`)
+
+// check reads the frame shape out of one line. A frame that carries a method is
+// a request or a notification, and neither can withdraw an ask.
+func (s *sniffer) check(line []byte) {
+	if !bytes.Contains(line, sniffMark) {
+		return
+	}
+	var m acpwire.Msg
+	if json.Unmarshal(line, &m) != nil || m.Method != "" || len(m.ID) == 0 || m.Result == nil {
+		return
+	}
+	s.c.withdrawn(string(m.ID))
+}
+
+// canonID is the correlation key of a JSON-RPC id, the way the codec keys its
+// own calls: a number on its canonical decimal form, anything else on its text.
+func canonID(raw json.RawMessage) string {
+	t := strings.TrimSpace(string(raw))
+	if len(t) > 0 && t[0] == '"' {
+		if s, err := strconv.Unquote(t); err == nil {
+			return s
+		}
+		return t
+	}
+	if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+		return strconv.FormatInt(n, 10)
+	}
+	return t
 }
