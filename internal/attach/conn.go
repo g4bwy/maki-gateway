@@ -1,7 +1,6 @@
 package attach
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"maki-gateway/internal/acpwire"
 )
@@ -42,17 +40,19 @@ const refusalNotice = "attach refused (pid %d): plugin too old for this gateway,
 // spelling: an empty object, not an absent field.
 var noArgs = map[string]any{}
 
-// snifferMax bounds one line the withdrawal sniffer parses. The frame it looks
-// for is one small answer, so a longer line is none of its business.
-const snifferMax = 64 << 10
+// requestIDPrefix is the shape of every request id this gateway puts on a plugin
+// socket: the JSON string "g-<n>". A plugin numbers its own requests from 1000
+// upward, and a bare number this side could mint reaches that range, so the
+// answer a plugin sends to its own prompt withdrawal used to land on an
+// unrelated open call (WIRE 1.4). Strings cannot collide with numbers.
+const requestIDPrefix = "g-"
 
 // conn is one plugin socket: the acpwire connection, what the handshake
 // reported, the liveness clock, and the tool cards this connection has seen open.
 type conn struct {
-	e     *Engine
-	path  string
-	wire  *acpwire.Conn
-	sniff *sniffer
+	e    *Engine
+	path string
+	wire *acpwire.Conn
 
 	mu     sync.Mutex
 	misses int
@@ -60,34 +60,16 @@ type conn struct {
 	tools  map[string]bool
 }
 
-// socket is the plugin connection as the codec sees it. Reads pass through the
-// sniffer, which is the only way to see the one frame the codec drops by rule
-// (see sniffer).
-type socket struct {
-	nc    net.Conn
-	sniff *sniffer
-}
-
-func (s socket) Read(p []byte) (int, error) {
-	n, err := s.nc.Read(p)
-	if n > 0 {
-		s.sniff.feed(p[:n])
-	}
-	return n, err
-}
-
-func (s socket) Write(p []byte) (int, error) { return s.nc.Write(p) }
-func (s socket) Close() error                { return s.nc.Close() }
-
 func newConn(e *Engine, path string, nc net.Conn) *conn {
 	c := &conn{e: e, path: path, tools: map[string]bool{}}
-	c.sniff = &sniffer{c: c}
-	c.wire = acpwire.New(socket{nc: nc, sniff: c.sniff}, acpwire.Options{
-		MaxLine:        e.t.maxLine,
-		Death:          errGone,
-		OnRequest:      c.onAsk,
-		OnNotification: c.onNote,
-		OnClose:        c.died,
+	c.wire = acpwire.New(nc, acpwire.Options{
+		MaxLine:         e.t.maxLine,
+		Death:           errGone,
+		IDPrefix:        requestIDPrefix,
+		OnRequest:       c.onAsk,
+		OnNotification:  c.onNote,
+		OnStrayResponse: c.withdrawn,
+		OnClose:         c.died,
 	})
 	return c
 }
@@ -219,67 +201,6 @@ func (c *conn) died(cause error) {
 	if tracked := c.e.forgetConn(c); tracked && !c.e.isClosed() {
 		c.e.disconnected(c.pluginPID())
 	}
-}
-
-// sniffer watches the bytes a plugin writes for the one frame the codec cannot
-// hand to anyone: the plugin's own answer to a request it sent (WIRE 10.2, 10.3).
-// Such a frame is a response whose id matches no open request on this side, and
-// WIRE 1.4 makes the codec drop it, so the withdrawal of a dialog would be
-// invisible and the browser's prompt would sit there forever. The sniffer is
-// armed only while this connection parks an ask, parses nothing above
-// snifferMax bytes, and runs on the codec's own read goroutine.
-type sniffer struct {
-	c     *conn
-	on    atomic.Bool
-	armed bool
-	line  []byte
-	skip  bool
-}
-
-// feed runs on the codec's read goroutine and owns every field but the flag the
-// engine sets, so the edge between off and on is read here rather than written
-// there: a cycle starts on a line boundary and cannot splice two unrelated reads.
-func (s *sniffer) feed(p []byte) {
-	on := s.on.Load()
-	if on != s.armed {
-		s.armed, s.line, s.skip = on, s.line[:0], false
-	}
-	if !on {
-		return
-	}
-	for _, b := range p {
-		if b != '\n' {
-			if s.skip {
-				continue
-			}
-			if len(s.line) >= snifferMax {
-				s.line, s.skip = s.line[:0], true
-				continue
-			}
-			s.line = append(s.line, b)
-			continue
-		}
-		line := s.line
-		s.line, s.skip = s.line[:0], false
-		if len(line) > 0 {
-			s.check(line)
-		}
-	}
-}
-
-var sniffMark = []byte(`"result"`)
-
-// check reads the frame shape out of one line. A frame that carries a method is
-// a request or a notification, and neither can withdraw an ask.
-func (s *sniffer) check(line []byte) {
-	if !bytes.Contains(line, sniffMark) {
-		return
-	}
-	var m acpwire.Msg
-	if json.Unmarshal(line, &m) != nil || m.Method != "" || len(m.ID) == 0 || m.Result == nil {
-		return
-	}
-	s.c.withdrawn(string(m.ID))
 }
 
 // canonID is the correlation key of a JSON-RPC id, the way the codec keys its

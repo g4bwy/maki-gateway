@@ -42,6 +42,14 @@ type Options struct {
 	// MaxLine is the frame limit in bytes. Zero means MaxLine.
 	MaxLine int
 
+	// IDPrefix makes every request this side sends carry a JSON string id of
+	// "<prefix><n>" instead of a bare number. A side that shares its socket with a
+	// peer which also sends requests sets it, because a number this side minted can
+	// otherwise be the number the peer minted for its own request, and the peer's
+	// answer to that request then reads as the answer to this side's call. Empty
+	// means plain numbers.
+	IDPrefix string
+
 	// Death is the error every call still open receives when the connection
 	// ends. A caller with a name for that event (a process that exited, a plugin
 	// that went away) sets it, so a waiter reads a cause rather than a close.
@@ -66,6 +74,13 @@ type Options struct {
 	// they are not a fault, and a protocol grows by adding notifications.
 	OnNotification func(method string, params json.RawMessage)
 
+	// OnStrayResponse takes a response frame that matches no call this side has
+	// open. The call gave up on the id, the peer answered twice, or the peer
+	// answered a request it sent itself, which is how it withdraws a prompt it is
+	// still holding. It is never a fault, so the connection stays open. A frame
+	// that answers with an error carries a nil result.
+	OnStrayResponse func(id, result json.RawMessage)
+
 	// OnClose runs once per connection, after it ended and after every open call
 	// failed. It reports the cause: io.EOF for a clean end of stream, a read
 	// error, ErrFrameTooLarge, or ErrClosed for a local Close.
@@ -84,7 +99,10 @@ type Conn struct {
 
 	onReq   func(context.Context, *Request) error
 	onNote  func(method string, params json.RawMessage)
+	onStray func(id, result json.RawMessage)
 	onClose func(cause error)
+
+	idPrefix string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -118,17 +136,19 @@ func New(rw io.ReadWriter, opts Options) *Conn {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Conn{
-		rw:      rw,
-		log:     log.With("comp", "acpwire"),
-		maxLine: max,
-		death:   death,
-		framer:  framer{max: max, buf: make([]byte, 0, firstFrameCap)},
-		onReq:   opts.OnRequest,
-		onNote:  opts.OnNotification,
-		onClose: opts.OnClose,
-		ctx:     ctx,
-		cancel:  cancel,
-		pending: map[string]chan Msg{},
+		rw:       rw,
+		log:      log.With("comp", "acpwire"),
+		maxLine:  max,
+		death:    death,
+		framer:   framer{max: max, buf: make([]byte, 0, firstFrameCap)},
+		onReq:    opts.OnRequest,
+		onNote:   opts.OnNotification,
+		onStray:  opts.OnStrayResponse,
+		onClose:  opts.OnClose,
+		idPrefix: opts.IDPrefix,
+		ctx:      ctx,
+		cancel:   cancel,
+		pending:  map[string]chan Msg{},
 	}
 	c.enc = json.NewEncoder(&c.wbuf)
 	return c
@@ -196,16 +216,21 @@ func (c *Conn) Send(method string, params any) (*Call, error) {
 	}
 	c.mu.Lock()
 	c.next++
-	key := strconv.FormatInt(c.next, 10)
+	n := strconv.FormatInt(c.next, 10)
+	if c.idPrefix != "" {
+		n = strconv.Quote(c.idPrefix + n)
+	}
+	id := json.RawMessage(n)
+	key := idKey(id)
 	ch := make(chan Msg, 1)
 	c.pending[key] = ch
 	c.mu.Unlock()
 
-	if err := c.write(outFrame{ID: json.RawMessage(key), Method: method, Params: params}); err != nil {
+	if err := c.write(outFrame{ID: id, Method: method, Params: params}); err != nil {
 		c.forget(key)
 		return nil, err
 	}
-	return &Call{ID: json.RawMessage(key), Resp: ch, conn: c, key: key}, nil
+	return &Call{ID: id, Resp: ch, conn: c, key: key}, nil
 }
 
 // Call sends a request and waits for the answer, or for ctx to end. A ctx that
@@ -286,7 +311,8 @@ func (c *Conn) write(frame outFrame) error {
 }
 
 // answer hands a response to the call that sent it. An id with no waiter is
-// logged and dropped: the call timed out, or the peer answered twice.
+// logged, handed to OnStrayResponse, and dropped: the call timed out, the peer
+// answered twice, or the peer answered its own request.
 func (c *Conn) answer(m *Msg) {
 	key := idKey(m.ID)
 	c.mu.Lock()
@@ -295,6 +321,9 @@ func (c *Conn) answer(m *Msg) {
 	c.mu.Unlock()
 	if !ok {
 		c.log.Debug("acpwire: reply for a call that is gone", "id", string(m.ID))
+		if c.onStray != nil {
+			c.onStray(m.ID, m.Result)
+		}
 		return
 	}
 	ch <- *m

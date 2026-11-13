@@ -166,9 +166,12 @@ func (c *conn) parkAsk(r *acpwire.Request) error {
 // withdrawn closes a dialog the plugin ended on its own, which is the 55 second
 // fallthrough of WIRE 10.2 and the answer elsewhere of WIRE 10.3. The frame that
 // says so answers a request this side never sent, so it reaches here through the
-// sniffer rather than through the codec.
-func (c *conn) withdrawn(wireID string) {
-	a := c.e.removeAskByWire(c, canonID(json.RawMessage(wireID)))
+// codec's report of a reply with no open call rather than through any waiter. An
+// id that names no parked ask belongs to a call this side gave up on, and is
+// nothing's business. A withdrawal that answers with an error carries no result,
+// and closes the dialog the same way: the plugin holds nothing any more.
+func (c *conn) withdrawn(id json.RawMessage, _ json.RawMessage) {
+	a := c.e.removeAskByWire(c, canonID(id))
 	if a == nil {
 		return
 	}

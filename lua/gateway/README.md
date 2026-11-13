@@ -236,7 +236,7 @@ connections that had not answered get the same `cancelled` answer (WIRE 10.3).
   A block longer than one frame arrives in chunks, and a reader joins chunks that
   carry the same kind. `session/resume` answers with no replay.
 - `session/list` is the only way to learn that a tab opened or closed, and the
-  gateway polls it every 5 seconds as its liveness clock (WIRE 1.5).
+  gateway polls it every 3 seconds as its liveness clock (WIRE 1.5).
 - `session/set_title` of `""` clears the name, and the tab falls back to the title
   the host generated. v1 used `null` for that, and v2 does not accept it.
 - `_sh.maki/pop_queue` takes no argument. It acts on the tab the terminal has

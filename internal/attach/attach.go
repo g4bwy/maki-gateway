@@ -314,14 +314,13 @@ func (e *Engine) routeTo(session string, c *conn) {
 // nextAskID mints one permission request id.
 func (e *Engine) nextAskID() int64 { return e.nextRequestID.Add(1) }
 
-// armAsk parks one ask and turns on the sniffer that watches for its withdrawal.
+// armAsk parks one ask until the browser or the plugin ends it.
 func (e *Engine) armAsk(a *ask) {
 	e.mu.Lock()
 	if !e.closed {
 		e.asks[a.requestID] = a
 	}
 	e.mu.Unlock()
-	a.c.sniff.on.Store(true)
 }
 
 // takeAsk removes the ask of one request id, or returns nil when this side holds
@@ -331,9 +330,6 @@ func (e *Engine) takeAsk(requestID int64) *ask {
 	a := e.asks[requestID]
 	delete(e.asks, requestID)
 	e.mu.Unlock()
-	if a != nil {
-		a.c.armSniffer()
-	}
 	return a
 }
 
@@ -341,37 +337,14 @@ func (e *Engine) takeAsk(requestID int64) *ask {
 // cost: a connection holds at most a few dialogs at a time.
 func (e *Engine) removeAskByWire(c *conn, wireID string) *ask {
 	e.mu.Lock()
-	var found *ask
-	for _, a := range e.asks {
-		if a.c == c && a.wireID == wireID {
-			found = a
-			delete(e.asks, a.requestID)
-			break
-		}
-	}
-	e.mu.Unlock()
-	if found != nil {
-		c.armSniffer()
-	}
-	return found
-}
-
-// armSniffer keeps the withdrawal sniffer of this connection on only while it
-// still parks an ask, so a plugin that never asks costs one atomic load per read.
-func (c *conn) armSniffer() {
-	on := c.e.asksOpenOn(c)
-	c.sniff.on.Store(on)
-}
-
-func (e *Engine) asksOpenOn(c *conn) bool {
-	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, a := range e.asks {
-		if a.c == c {
-			return true
+		if a.c == c && a.wireID == wireID {
+			delete(e.asks, a.requestID)
+			return a
 		}
 	}
-	return false
+	return nil
 }
 
 // owner resolves a session to its connection. The map is built from list
@@ -659,6 +632,14 @@ func isMethodNotFound(err error) bool {
 	return errors.As(err, &we) && we.Code == acpwire.CodeMethodNotFound
 }
 
+// noTab is the answer of a plugin that will not open a tab: the method it does not
+// have, or the session it cannot take. WIRE 13 gives both a code, and neither is
+// something a client can fix over this socket, so both reach 501.
+func noTab(err error) bool {
+	var we *acpwire.Error
+	return errors.As(err, &we) && (we.Code == acpwire.CodeMethodNotFound || we.Code == codeHeld)
+}
+
 // Kill has no method on this socket: the TUI owns its process and outlives the
 // gateway by design, so DELETE answers 400 for a live row. What this side can do
 // is hang up, which drops that TUI's tabs from the list until the next scan dials
@@ -686,11 +667,12 @@ func (e *Engine) SetTitle(id, title string) error {
 }
 
 // Create cannot open a tab. WIRE Appendix B.1 fixes that no session/new exists on
-// this socket: a live tab is opened by a person at the terminal, and a plugin
-// answers session/new with -32601. The request still goes out to the lowest
-// socket, so a build that does answer one is read, and a refusal is reported as
-// what it is. A caller that must create a session spawns maki acp, which is what
-// the HTTP route does.
+// this socket: a live tab is opened by a person at the terminal, and the plugin of
+// WIRE 12 answers the unknown method with -32601. The request still goes out to the
+// lowest socket, so a build that does answer one is read, and either refusal to
+// open a tab (-32601, or the -32000 of a TUI that will not take the claim) is
+// reported as a thing no client can fix here. A caller that must create a session
+// spawns maki acp, which is what the HTTP route does.
 func (e *Engine) Create(req model.CreateRequest) (string, error) {
 	conns := e.live()
 	if len(conns) == 0 {
@@ -704,7 +686,7 @@ func (e *Engine) Create(req model.CreateRequest) (string, error) {
 	raw, err := conns[0].request(ctx, mSessionNew, args)
 	cancel()
 	if err != nil {
-		if isMethodNotFound(err) {
+		if noTab(err) {
 			return "", model.ErrUnsupported
 		}
 		return "", MapError(err)

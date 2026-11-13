@@ -18,8 +18,15 @@ import (
 // setup starts one engine over a fresh socket dir with one plugin on pid 111.
 func setup(t *testing.T) (*fakeTUI, *Engine, chan model.Event) {
 	t.Helper()
+	return setupWith(t, fastTimings())
+}
+
+// setupWith is setup over one set of timings, for a test that has to keep one call
+// open on the socket while it does something else.
+func setupWith(t *testing.T, tt timings) (*fakeTUI, *Engine, chan model.Event) {
+	t.Helper()
 	dir := t.TempDir()
-	e, ch := startEngine(t, dir, fastTimings())
+	e, ch := startEngine(t, dir, tt)
 	f := newFakeTUI(t, dir, "pid-111.sock", 111)
 	waitFor(t, "the plugin socket to be tracked", func() bool { return e.connCount() == 1 })
 	// Consume the connect announcement, so a later drain() only sees what the
@@ -392,6 +399,14 @@ func TestCreateCannotOpenATab(t *testing.T) {
 			t.Errorf("v2 sends no %q argument: %v", gone, fr)
 		}
 	}
+
+	// The other refusal of WIRE 13 that means no tab: -32000, the session this TUI
+	// cannot take. It is a thing no client can fix over this socket, so it reads
+	// the same way as the method that is not there.
+	first.failCode(mSessionNew, codeHeld, "this TUI opens tabs at the terminal")
+	if _, err := e.Create(model.CreateRequest{Cwd: "/work"}); !errors.Is(err, model.ErrUnsupported) {
+		t.Errorf("a refused claim: err = %v, want ErrUnsupported", err)
+	}
 }
 
 // TestNoV1FrameEverLeavesTheGateway pins the rewire: none of the bespoke ops of
@@ -536,10 +551,11 @@ func TestFocusTaskCarriesTheTaskID(t *testing.T) {
 	if extra := drain(ch); len(extra) != 0 {
 		t.Errorf("a follow publishes task_focus only: %+v", extra)
 	}
-	// No frame on this socket may spend its request number on anything but a
-	// number: an answer that cannot be correlated is dropped (WIRE 1.4).
-	if bad := f.framesWithoutNumber(); len(bad) != 0 {
-		t.Errorf("%d request frames arrived with no number in id: %v", len(bad), bad)
+	// No frame on this socket may spend its request id on a number: the plugin is
+	// free to mint the same number for its own ask, and the answer to that ask
+	// would then be read as the answer to this call (WIRE 1.4).
+	if bad := f.framesWithForeignID(); len(bad) != 0 {
+		t.Errorf("%d request frames arrived with an id this gateway does not mint: %v", len(bad), bad)
 	}
 }
 
@@ -602,28 +618,22 @@ func TestFocusCallsAnswerInOrder(t *testing.T) {
 	if len(frames) != 5 {
 		t.Fatalf("saw %d task_focus frames, want one per call", len(frames))
 	}
-	numbers := map[int64]string{}
+	ids := map[string]string{}
 	for _, fr := range frames {
-		n, err := strconvParseInt(fr.id)
-		if err != nil {
-			t.Errorf("follow of %s carried no request number: %s", fr.params[argTaskID], fr.id)
+		if !isGatewayID(fr.id) {
+			t.Errorf("follow of %s carried an id this gateway does not mint: %s",
+				strParam(fr.params, argTaskID), fr.id)
 			continue
 		}
 		task := strParam(fr.params, argTaskID)
-		if twice, dup := numbers[n]; dup {
-			t.Errorf("request number %d was used by the follow of %s and of %s", n, twice, task)
+		if twice, dup := ids[string(fr.id)]; dup {
+			t.Errorf("request id %s was used by the follow of %s and of %s", fr.id, twice, task)
 		}
-		numbers[n] = task
+		ids[string(fr.id)] = task
 	}
-	if len(numbers) != 5 {
-		t.Errorf("%d distinct request numbers for 5 follows, want one each", len(numbers))
+	if len(ids) != 5 {
+		t.Errorf("%d distinct request ids for 5 follows, want one each", len(ids))
 	}
-}
-
-func strconvParseInt(raw json.RawMessage) (int64, error) {
-	var n int64
-	err := json.Unmarshal(raw, &n)
-	return n, err
 }
 
 // TestTaskFocusEventCarriesTheTask is the other direction: the person at the
@@ -879,6 +889,74 @@ func TestWithdrawnAskClosesTheDialog(t *testing.T) {
 	// the connection is healthy for everything else.
 	if _, err := e.List(); err != nil || e.connCount() != 1 {
 		t.Errorf("a withdrawn ask must not cost the connection: %v %d", err, e.connCount())
+	}
+}
+
+// TestWithdrawalCannotBeMisroutedIntoAnOpenCall is the 83 minute bug on the wire.
+// The plugin numbered its own ask with a number this side had also spent, so its
+// withdrawal answered an unrelated open call. WIRE 1.4 mints gateway ids as
+// strings, so the two number spaces cannot meet: the withdrawal closes the dialog
+// and the call keeps waiting for its own answer.
+func TestWithdrawalCannotBeMisroutedIntoAnOpenCall(t *testing.T) {
+	long := fastTimings()
+	long.timeout = 3 * time.Second
+	f, e, ch := setupWith(t, long)
+	routeSession(t, e, "s1")
+	f.holdOn(mPlan)
+
+	type answer struct {
+		raw json.RawMessage
+		err error
+	}
+	held := make(chan answer, 1)
+	go func() {
+		raw, err := e.raw("s1", mPlan, noArgs)
+		held <- answer{raw, err}
+	}()
+	waitFor(t, "the gateway plan call to reach the plugin", func() bool {
+		return len(f.framesOf(mPlan)) > 0
+	})
+	calls := f.framesOf(mPlan)
+	if len(calls) != 1 {
+		t.Fatalf("saw %d plan frames, want the one open call", len(calls))
+	}
+	// The number this side spent on that call. A plugin that mints its asks from
+	// 1000 can hand the same number back as its own request id.
+	clash := idNumber(t, calls[0].id)
+
+	f.askWithID(clash, "s1", "bash: ls")
+	ev := wantEvent(t, ch, evPermission)
+	f.answerOwnAsk(clash)
+	cancelled := wantEvent(t, ch, evPermissionCancel)
+	if cancelled.RequestID != ev.RequestID {
+		t.Fatalf("permission_cancel = %+v, want the dialog of the ask (%d)", cancelled, ev.RequestID)
+	}
+	select {
+	case got := <-held:
+		t.Fatalf("the withdrawal answered the open call: %+v %v", got.raw, got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	const planBody = `"# plan"`
+	f.answerHeld(t, mPlan, map[string]any{keyMode: "plan", keyPath: "/tmp/plan.md",
+		keyReady: true, keyContent: "# plan"})
+	var got answer
+	select {
+	case got = <-held:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the open call never got its own answer")
+	}
+	if got.err != nil {
+		t.Fatalf("plan: %v", got.err)
+	}
+	if !strings.Contains(string(got.raw), planBody) {
+		t.Errorf("plan result = %s, want the plugin's own body", got.raw)
+	}
+	if err := e.RespondPermission(ev.RequestID, model.DecisionAllow, ""); !errors.Is(err, model.ErrNotFound) {
+		t.Errorf("the withdrawn dialog must be gone: %v", err)
+	}
+	if e.connCount() != 1 {
+		t.Errorf("a stray answer must not cost the connection: %d conns", e.connCount())
 	}
 }
 

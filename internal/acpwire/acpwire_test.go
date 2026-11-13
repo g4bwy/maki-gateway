@@ -556,6 +556,115 @@ func TestResponseWithNoAnswerCloses(t *testing.T) {
 	}
 }
 
+// TestStrayResponseReachesTheHandler is the report a caller gets when a response
+// matches no open call: the answer of a live call is routed and never reaches the
+// hook, a second answer for the same id is a stray, and an error answer arrives as
+// a stray with no result. None of them is a fault of the connection.
+func TestStrayResponseReachesTheHandler(t *testing.T) {
+	stray := make(chan Msg, 4)
+	c, p := dial(t, Options{OnStrayResponse: func(id, result json.RawMessage) {
+		stray <- Msg{ID: id, Result: result}
+	}})
+
+	call, err := c.Send("session/list", nil)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	p.line(t)
+	p.send(t, `{"jsonrpc":"2.0","id":1,"result":{"sessions":[]}}`+"\n")
+	if raw, err := call.Await(context.Background()); err != nil || string(raw) != `{"sessions":[]}` {
+		t.Fatalf("Await = %s, %v", raw, err)
+	}
+	if len(stray) != 0 {
+		t.Fatalf("the answer of an open call reached the hook: %v", <-stray)
+	}
+
+	p.send(t, `{"jsonrpc":"2.0","id":1,"result":{"late":true}}`+"\n")
+	p.send(t, `{"jsonrpc":"2.0","id":"tab-9","error":{"code":-32603,"message":"boom"}}`+"\n")
+	for _, want := range []struct{ id, result string }{
+		{"1", `{"late":true}`},
+		{`"tab-9"`, ""},
+	} {
+		var got Msg
+		select {
+		case got = <-stray:
+		case <-time.After(peerWait):
+			t.Fatalf("no stray report for id %s", want.id)
+		}
+		if string(got.ID) != want.id || string(got.Result) != want.result {
+			t.Errorf("stray = (%s, %s), want (%s, %s)", got.ID, got.Result, want.id, want.result)
+		}
+	}
+	if c.Closed() {
+		t.Error("a stray reply must not end the connection")
+	}
+	// A connection with no hook keeps the old behavior: the frame is dropped, and
+	// the conversation goes on (TestIDTypes covers the drop itself).
+	quiet, qp := dial(t, Options{OnRequest: answerAll(`{"ok":true}`)})
+	qp.send(t, `{"jsonrpc":"2.0","id":42,"result":{}}`+"\n")
+	if err := quiet.Notify("after", nil); err != nil {
+		t.Fatalf("Notify after a stray reply: %v", err)
+	}
+	if !strings.Contains(qp.line(t), "after") {
+		t.Error("the connection did not survive a stray reply")
+	}
+}
+
+// TestIDPrefixKeysStringRequests is the ruling of WIRE 1.4 for a side that shares
+// its socket with a peer that also sends requests: its ids are JSON strings, so a
+// peer's answer to one of its own requests can never be read as the answer to a
+// call here. The number and the string spelling of the same count both miss.
+func TestIDPrefixKeysStringRequests(t *testing.T) {
+	stray := make(chan string, 4)
+	c, p := dial(t, Options{
+		IDPrefix:        "g-",
+		OnRequest:       answerAll(`{"ok":true}`),
+		OnStrayResponse: func(id, _ json.RawMessage) { stray <- string(id) },
+	})
+
+	call, err := c.Send("session/prompt", nil)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if string(call.ID) != `"g-1"` {
+		t.Fatalf("outgoing id = %s, want the string \"g-1\"", call.ID)
+	}
+	sent := p.frame(t)
+	if string(sent.ID) != `"g-1"` || sent.Method != "session/prompt" {
+		t.Fatalf("frame on the wire = %+v, want a string id and the method", sent)
+	}
+
+	p.send(t, `{"jsonrpc":"2.0","id":1,"result":{"outcome":"cancelled"}}`+"\n")
+	p.send(t, `{"jsonrpc":"2.0","id":"1","result":{"outcome":"cancelled"}}`+"\n")
+	for _, foreign := range []string{"1", `"1"`} {
+		select {
+		case got := <-stray:
+			if got != foreign {
+				t.Errorf("stray id = %s, want %s", got, foreign)
+			}
+		case <-time.After(peerWait):
+			t.Fatalf("the reply to id %s never reached the stray hook", foreign)
+		}
+	}
+	select {
+	case got := <-stray:
+		t.Fatalf("a foreign id was reported twice: %s", got)
+	default:
+	}
+
+	p.send(t, `{"jsonrpc":"2.0","id":"g-1","result":{"stopReason":"end_turn"}}`+"\n")
+	raw, err := call.Await(context.Background())
+	if err != nil {
+		t.Fatalf("Await: %v", err)
+	}
+	if string(raw) != `{"stopReason":"end_turn"}` {
+		t.Errorf("result = %s, want the body of the call", raw)
+	}
+	if len(stray) != 0 {
+		t.Errorf("the answer of an open call reached the hook: %s", <-stray)
+	}
+}
+
 func wireErrorOf(t *testing.T, err error) (int, string) {
 	t.Helper()
 	var e *Error

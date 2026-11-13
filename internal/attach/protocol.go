@@ -118,6 +118,8 @@ const (
 
 	// codeNotLive is the -32002 of WIRE 13: a sessionId this TUI does not hold.
 	codeNotLive = -32002
+	// codeHeld is the -32000 of WIRE 13: a session this TUI cannot take.
+	codeHeld = -32000
 )
 
 // meta is the _meta object of a frame. Values stay raw: ACP reads them as JSON,

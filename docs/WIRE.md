@@ -108,12 +108,27 @@ reject a frame over it.
 ### 1.4 Ids
 
 - An `id` is a JSON number or a JSON string. Both sides must accept either in a frame they
-  read. The gateway numbers its own requests from 1 upward, and a plugin numbers its own
-  requests from 1000 upward, so the two directions cannot collide.
+  read, and both key an open request on the id as it arrived: a number on its canonical
+  decimal spelling, a string on its text. `"7"` and `7` are two ids, and a peer that
+  re-spells `7` as `7.0` still reaches its caller (`idKey` in `internal/acpwire/frame.go`).
+- The gateway numbers its own requests with the JSON strings `"g-1"`, `"g-2"`, and onward
+  (`requestIDPrefix` in `internal/attach/conn.go`, `IDPrefix` in `internal/acpwire.Options`).
+  A plugin numbers its own requests with JSON numbers from 1000 upward, keeps them numbers,
+  and must not spend one below 1000 (`ASK_ID_FIRST` in `lua/gateway/conns.lua`). The split
+  is the point. Both directions share one socket, so a number this side minted can be the
+  number a plugin minted for its own ask, and the frame a plugin writes to withdraw that ask
+  (section 10.2) is then read as the answer to an unrelated open call. One long-running TUI
+  reached that state in 83 minutes of ordinary polling. Strings cannot collide with numbers.
 - An answer echoes the `id` of its request as it arrived, byte for byte. A writer must not
-  re-format a number or re-encode a string on the way back.
-- A response whose `id` matches no open request is dropped and logged. It is never fatal,
-  because the caller gave up on that call or the process restarted.
+  re-format a number or re-encode a string on the way back. A plugin that decodes JSON and
+  re-encodes the value it read satisfies this for both shapes, which is what
+  `protocol.lua` does.
+- A response whose `id` matches no open request is logged, and the reader is told about it
+  rather than left to guess, because one such frame is a protocol event and not noise: the
+  plugin answering a request it sent itself (sections 10.2 and 10.3). `OnStrayResponse` in
+  `internal/acpwire` is that report, and `internal/attach` closes the dialog it names. The
+  connection stays open either way, because the other reason for a stray id is a caller that
+  gave up on that call or a process that restarted.
 - One request gets at most one answer that counts. A second answer for the same `id` is
   dropped.
 
@@ -126,10 +141,11 @@ already left, so an answer that arrives after a deadline has no effect either wa
 
 Liveness comes from two facts. A socket that dies reports it at once, because the reader
 sees the end of the stream. A plugin that is stuck reports itself, because its answers
-stop arriving. The gateway uses the `session/list` call it already makes every 5 seconds
-as its liveness clock: two of those calls in a row that fail or time out end the
-connection, and the tabs of that TUI leave the list. That is the same treatment v1 gave a
-plugin that missed two pings.
+stop arriving. The gateway uses the `session/list` call it already makes on its scan clock
+(3 seconds with the default timings, `scanEvery` in `defaultTimings` of
+`internal/attach/attach.go`) as its liveness clock: two of those calls in a row that fail or
+time out end the connection, and the tabs of that TUI leave the list. That is the same
+treatment v1 gave a plugin that missed two pings.
 
 A request that a plugin answers late is still a correct answer. A deadline is a caller's
 choice, not a protocol event.
@@ -184,6 +200,19 @@ The four `sh.maki/` keys in `_meta` are required:
 | `sh.maki/attach_proto` | number | the build of this document. v2 is `2` |
 | `sh.maki/maki_version` | string | the maki version, as the host reports it |
 
+`sh.maki/maki_version` is the one key of the four the plugin cannot ask the host for: maki
+answers no Lua call with its own version. The plugin probes the binary of this very process,
+with `readlink /proc/<pid>/exe` and `--version` on the file it names (`version_command` and
+`probe_version` in `lua/gateway/host.lua`), which is the same shape the gateway's own health
+route uses. The probe runs once, on a child task, because code that runs while the plugin
+loads cannot park.
+
+`unknown` is an allowed value, and a reader must take it: it is what the key reads before the
+probe lands, on a system with no `/proc`, and for a host that prints no version. It is a fact
+about this plugin rather than a number that might be wrong. The gateway writes the value into
+its log lines and decides nothing from it. The gate of section 2.2 reads
+`sh.maki/attach_proto`, which the plugin knows exactly.
+
 A plugin can add more `sh.maki/` keys. One useful addition is `sh.maki/methods`, an array
 of the extension method names that plugin answers, which lets a reader check a capability
 instead of trying a call. The gateway ignores every `sh.maki/` key it does not know.
@@ -232,8 +261,8 @@ requests, responses, and notifications, and to the objects nested in them that A
 
 ## 3. `session/list`: the tabs of this TUI
 
-The gateway calls it to build the list, and every 5 seconds as its liveness clock. It is
-the only way to learn that a tab opened or closed.
+The gateway calls it to build the list, and on its scan clock as its liveness clock (see
+section 1.5 for the interval). It is the only way to learn that a tab opened or closed.
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"session/list","params":{}}
@@ -542,6 +571,21 @@ plugin pushes `session/update` with `current_mode_update` for the change too, be
 mode can also move at the terminal, where no request on this socket is involved (section
 11.1).
 
+A move at the terminal is found by diffing the list poll, and that sets its delay. The host
+reports no mode event, so the plugin reads the mode of every row of `session/list`, keeps the
+one it last announced for that tab, and pushes `current_mode_update` when the two differ
+(`watch_mode` in `lua/gateway/ops.lua`, and the row's `sh.maki/mode` of section 3.1). The
+gateway asks on the scan clock of section 1.5 (3 seconds by default), so a mode moved at the
+screen reaches the socket up to one poll interval later. A plugin that could push on the move
+itself is allowed, and keeps the diff as the backstop.
+
+What the gateway does with the update is fixed here: it reads it, logs it, and publishes
+nothing. `model.Session` has no mode field and the SSE envelope has no mode event
+(`docs/CONTRACTS.md` 2), so the mode of a live tab is not on the browser's surface, and the
+chip there shows the mode that browser last asked for. A plugin that wants the screen to show
+the truth needs a field added to the frozen surface, which is a `docs/CONTRACTS.md` change and
+not a change to this document.
+
 ### 8.2 `session/set_title`
 
 ```json
@@ -705,10 +749,20 @@ shows the terminal prompt, and it ends its own ask:
 ```
 
 The plugin sends that frame itself, on the same connection, as the answer to the request
-it sent. The gateway reads it as a withdrawn dialog: it clears the parked ask and
-publishes the SSE `permission_cancel` event with the request id it had published for that
-ask. v1 reported the same fact with a `permission_cancel` event frame, and v2 has no need
-of it, because ACP already has a word for "this ask is off".
+it sent. The gateway reads it as a withdrawn dialog: it clears the parked ask and publishes
+the SSE `permission_cancel` event with the request id it had published for that ask. v1
+reported the same fact with a `permission_cancel` event frame, and v2 has no need of it,
+because ACP already has a word for "this ask is off".
+
+How the gateway comes to see that frame is part of the contract, because the frame answers a
+request the gateway never sent. Section 1.4 routes it: the codec finds no open call with that
+id, and reports it to `OnStrayResponse` (`internal/acpwire`), and `internal/attach` reads
+that report as the withdrawal of the ask whose plugin id it is (`withdrawn` in
+`internal/attach/events.go`). An id that names no parked ask belongs to a call this side gave
+up on, and changes nothing. A withdrawal that answers with an `error` rather than a `result`
+closes the dialog the same way, because the plugin holds nothing either way. This replaces
+the byte-sniffing tap the gateway needed before section 1.4 put stray replies in front of a
+handler.
 
 The plugin must not park an ask that a connection has already answered. If the answer
 arrives first, there is nothing to cancel and no fallthrough to make.
@@ -817,6 +871,20 @@ fields of that kind, which are the v1 event payloads with their names moved to c
 | `tasks_changed` | none | `tasks_changed` | `tasks` |
 | `task_focus` | `taskId` | `task_focus` | `task_focus` with `id` set to `taskId` |
 
+The last column is ratified here, because the browser reducer was written against v1 and the
+SSE surface is frozen (`docs/CONTRACTS.md` 2). Two of its rows need stating exactly:
+
+- A `status` event publishes two hub events on the gateway side, in this order: the `status`
+  event carrying the fields this document names, then a `dirty` event with reason `status`
+  for the same tab (`sessionEvent` in `internal/attach/events.go`). The status event patches
+  the row the browser holds, and the dirty event is the refetch nudge v1 called `turn_start`:
+  a tab that starts or stops working changed its transcript.
+- The `usage_update` of `session/update` publishes one `dirty` event with reason `turn_end`,
+  and no token numbers, which is how the browser learns to refetch a turn the person at the
+  terminal started (section 11.1 rule 3, `sessionUpdate` in `internal/attach/events.go`). A
+  turn the gateway started ends with the answer to its own `session/prompt`, and publishes
+  nothing extra.
+
 - `kind` is required, and a reader must ignore an event whose `kind` it does not know. The
   list grows by addition, and that is the point of the wrapper.
 - `sessionId` is required on every kind, and it names the tab the change belongs to. That
@@ -894,6 +962,15 @@ The codes v2 uses:
 
 `-32000` for a held session is the same number `maki acp` uses for the same fact
 (`docs/ACP_MIN.md` 9), which is why one gateway mapping covers both engines.
+
+The code is not the mapping, and one row of section 13.1 has to be read before another. A tab
+that closed while a turn was parked answers that turn's `session/prompt` with `-32000` and the
+words `session not live: <sessionId> (the tab closed)` (`session_end` in
+`lua/gateway/turns.lua`). `-32000` is the held-elsewhere row, so a reader that keyed on the
+code alone would answer 409 to a person who asked about a tab that is gone. `MapError` reads
+the message, so `session not live` wins, and the caller gets its 404. A writer must therefore
+keep the words of section 13.1 in `error.message` even when the code of section 13 is already
+fixed: the words carry the fact.
 
 ### 13.1 The verbatim strings
 
@@ -1010,6 +1087,15 @@ each ceiling is a decision rather than an accident.
    project, and no HTTP route reached it, because `POST /api/sessions` always asks the web
    engine. A client that must create a session creates it by spawning `maki acp`, which is
    what the gateway does.
+
+   The gateway does not pretend otherwise, and it still asks once. `Engine.Create` in
+   `internal/attach/attach.go` sends one `session/new` to the lowest socket path it holds,
+   with `cwd` and an empty `mcpServers`, and sends it no second time to another socket. Its
+   answers are fixed: `-32601` (no such method, what the plugin of section 12 answers) and
+   `-32000` (a session this TUI will not take) both become `model.ErrUnsupported`, which
+   `internal/httpapi` writes as 501, and no live socket at all is `model.ErrNotFound`, which
+   is 404. A build that does answer `session/new` is read: its `sessionId` is routed to that
+   connection, the browser is told the list changed, and the caller gets the id.
 2. Discover the extensions. ACP gives a client no way to ask which extension methods an
    agent answers. A stock client cannot find `_sh.maki/messages`, and so cannot read the
    native transcript, and cannot see the queue of a tab. A plugin can advertise them under

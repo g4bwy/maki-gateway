@@ -51,6 +51,8 @@ type fakeTUI struct {
 	codes   map[string]int      // method -> canned error code
 	bare    map[string]bool     // method -> answer with neither reply field
 	hang    map[string]bool     // method -> take the ask and never answer it
+	hold    map[string]bool     // method -> take the ask until answerHeld writes its reply
+	held    []*heldRequest      // asks holdOn took, in the order they arrived
 	state   string              // what _sh.maki/queue answers
 	asks    map[string]*fakeAsk // plugin request id -> open ask
 	answers map[string]wirePermission
@@ -190,6 +192,7 @@ func newFakeTUI(t *testing.T, dir, name string, pid int, tabs ...map[string]any)
 		proto: float64(minAttachProto), makiVer: "0.7.1",
 		fail: map[string]string{}, codes: map[string]int{}, bare: map[string]bool{},
 		hang:  map[string]bool{},
+		hold:  map[string]bool{},
 		state: "started", asks: map[string]*fakeAsk{}, answers: map[string]wirePermission{},
 	}
 	if len(tabs) > 0 {
@@ -273,6 +276,7 @@ func (f *fakeTUI) restart() {
 	f.answers, f.frozen = map[string]wirePermission{}, false
 	f.fail, f.codes, f.bare = map[string]string{}, map[string]int{}, map[string]bool{}
 	f.hang = map[string]bool{}
+	f.hold, f.held = map[string]bool{}, nil
 	f.asks = map[string]*fakeAsk{}
 	f.noUI, f.focus, f.closed = false, "", false
 	pid := f.pid
@@ -330,12 +334,20 @@ func (ag *agent) onRequest(_ context.Context, r *acpwire.Request) error {
 	f := ag.f
 	f.mu.Lock()
 	bare, msg, code := f.bare[r.Method], f.fail[r.Method], f.codes[r.Method]
-	hung := f.hang[r.Method]
+	hung, held := f.hang[r.Method], f.hold[r.Method]
 	frozen, pid := f.frozen, f.pid
 	proto, noProto, maki := f.proto, f.noProto, f.makiVer
 	state, headless := f.state, f.noUI
 	f.mu.Unlock()
 
+	if held {
+		// A plugin that read the call and answers it when the test says so: this is
+		// how a call that is still open while other frames land is faked.
+		f.mu.Lock()
+		f.held = append(f.held, &heldRequest{ag: ag, req: r})
+		f.mu.Unlock()
+		return nil
+	}
 	if bare {
 		// A plugin that broke WIRE 1.3: a response carries exactly one reply field.
 		_ = ag.p.raw(`{"jsonrpc":"2.0","id":` + string(r.ID) + "}\n")
@@ -603,6 +615,25 @@ func (f *fakeTUI) withdraw(wireID string) {
 	}
 }
 
+// askWithID sends one session/request_permission carrying the number the test
+// names, in the number space the gateway used to share with it (WIRE 1.4). The
+// fake keeps no answer for it, because the test only needs the gateway to park it.
+func (f *fakeTUI) askWithID(id int64, session, title string) {
+	f.writeRaw(`{"jsonrpc":"2.0","id":` + strconv.FormatInt(id, 10) +
+		`,"method":"session/request_permission","params":{` +
+		`"sessionId":"` + session + `","toolCall":{"toolCallId":"tc-` + title +
+		`","name":"bash","title":"` + title + `","rawInput":{"command":"` + title + `"}},` +
+		`"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"},` +
+		`{"optionId":"reject_once","name":"Reject once","kind":"reject_once"}]}}` + "\n")
+}
+
+// answerOwnAsk is the withdrawal frame of WIRE 10.2 and 10.3 for one numbered ask:
+// the plugin answers the request it sent, and the id is a bare number.
+func (f *fakeTUI) answerOwnAsk(id int64) {
+	f.writeRaw(`{"jsonrpc":"2.0","id":` + strconv.FormatInt(id, 10) +
+		`,"result":{"outcome":{"outcome":"cancelled"}}}` + "\n")
+}
+
 // waitForAnswer waits until the gateway has answered one ask and hands back what
 // it wrote.
 func (f *fakeTUI) waitForAnswer(t *testing.T, wireID string) wirePermission {
@@ -759,6 +790,43 @@ func (f *fakeTUI) hangOn(method string) {
 	f.mu.Unlock()
 }
 
+// holdOn makes one method wait for the test: the plugin read the request and
+// answers it when answerHeld writes the reply, so a call can be open on the
+// socket while the test puts other frames beside it.
+func (f *fakeTUI) holdOn(method string) {
+	f.mu.Lock()
+	f.hold[method] = true
+	f.mu.Unlock()
+}
+
+// answerHeld writes the reply of the oldest held request of one method and hands
+// back the id it carried, which is the only thing that ties it to this call.
+func (f *fakeTUI) answerHeld(t *testing.T, method string, result any) json.RawMessage {
+	t.Helper()
+	f.mu.Lock()
+	var (
+		h   *heldRequest
+		idx = -1
+	)
+	for i, c := range f.held {
+		if c.req.Method == method {
+			h, idx = c, i
+			break
+		}
+	}
+	if idx >= 0 {
+		f.held = append(f.held[:idx], f.held[idx+1:]...)
+	}
+	f.mu.Unlock()
+	if h == nil {
+		t.Fatalf("fake: no held %s to answer", method)
+	}
+	if err := h.ag.answer(h.req, result); err != nil {
+		t.Fatalf("fake: answer held %s: %v", method, err)
+	}
+	return h.req.ID
+}
+
 // replyBare makes one method answer a frame with neither result nor error, which
 // WIRE 1.3 forbids.
 func (f *fakeTUI) replyBare(method string) {
@@ -833,19 +901,45 @@ func (f *fakeTUI) framesOf(method string) []request {
 	return out
 }
 
-// framesWithoutNumber are the recorded requests that carry no JSON number in
-// `id` (WIRE 1.4). A frame that spent that field on anything else gets its answer
-// dropped, so a test can name the shape the engine must never send.
-func (f *fakeTUI) framesWithoutNumber() []request {
+// framesWithForeignID are the recorded requests whose `id` is not one of this
+// gateway's strings of the form "g-<n>" (WIRE 1.4). A number here would be a
+// number the plugin is free to spend on its own ask, and the answer to that ask
+// would then land on this side's call.
+func (f *fakeTUI) framesWithForeignID() []request {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []request
 	for _, r := range f.frames {
-		if n, err := strconv.ParseInt(strings.TrimSpace(string(r.id)), 10, 64); err != nil || n == 0 {
+		if !isGatewayID(r.id) {
 			out = append(out, r)
 		}
 	}
 	return out
+}
+
+// isGatewayID reports whether one raw id is a JSON string minted by the gateway.
+func isGatewayID(raw json.RawMessage) bool {
+	var s string
+	if json.Unmarshal(raw, &s) != nil || !strings.HasPrefix(s, requestIDPrefix) {
+		return false
+	}
+	n, err := strconv.ParseInt(strings.TrimPrefix(s, requestIDPrefix), 10, 64)
+	return err == nil && n > 0
+}
+
+// idNumber is the count inside one gateway id, which is the number a plugin would
+// have spent on its own request before WIRE 1.4 put this side in string space.
+func idNumber(t *testing.T, raw json.RawMessage) int64 {
+	t.Helper()
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		t.Fatalf("id %s is not a gateway string id", raw)
+	}
+	n, err := strconv.ParseInt(strings.TrimPrefix(s, requestIDPrefix), 10, 64)
+	if err != nil {
+		t.Fatalf("id %s carries no number: %v", raw, err)
+	}
+	return n
 }
 
 func (f *fakeTUI) connCount() int {
@@ -925,6 +1019,13 @@ func wantEvent(t *testing.T, ch chan model.Event, typ string) model.Event {
 			t.Fatalf("no %q event received", typ)
 		}
 	}
+}
+
+// heldRequest is one gateway request that holdOn took and answerHeld has not
+// answered yet.
+type heldRequest struct {
+	ag  *agent
+	req *acpwire.Request
 }
 
 // safeBuffer is a log sink a plugin reader goroutine can write to while the test
